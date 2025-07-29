@@ -1,0 +1,68 @@
+{
+  "core": {
+    "current_version": "6.8.2",
+    "update_available": false,
+    "latest_version": null
+  },
+  "php_mysql": { "php_version": "8.2.12", "mysql_version": "10.4.32" },
+  "plugins": [
+    {
+      "name": "Akismet Anti-spam: Spam Protection",
+      "version": "5.4",
+      "active": false,
+      "update_available": true,
+      "latest_version": "5.5"
+    },
+    {
+      "name": "Hello Dolly",
+      "version": "1.7.2",
+      "active": false,
+      "update_available": false,
+      "latest_version": null
+    },
+    {
+      "name": "MainWP Child Reports",
+      "version": "2.2.6",
+      "active": true,
+      "update_available": false,
+      "latest_version": null
+    },
+    {
+      "name": "MainWP Dashboard",
+      "version": "5.4.0.16",
+      "active": true,
+      "update_available": false,
+      "latest_version": null
+    },
+    {
+      "name": "ManageWP - Worker",
+      "version": "4.9.23",
+      "active": false,
+      "update_available": false,
+      "latest_version": null
+    }
+  ],
+  "themes": [
+    {
+      "name": "Twenty Twenty-Five",
+      "version": "1.3",
+      "active": true,
+      "update_available": false,
+      "latest_version": null
+    },
+    {
+      "name": "Twenty Twenty-Four",
+      "version": "1.3",
+      "active": false,
+      "update_available": false,
+      "latest_version": null
+    },
+    {
+      "name": "Twenty Twenty-Three",
+      "version": "1.6",
+      "active": false,
+      "update_available": false,
+      "latest_version": null
+    }
+  ]
+}
