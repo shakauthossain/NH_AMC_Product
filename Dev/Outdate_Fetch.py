@@ -1,6 +1,6 @@
 import requests
 
-URL = "http://localhost/TestWP1/wp-json/site/v1/status"
+URL = "http://localhost/TestWP2/wp-json/site/v1/status"
 
 def get_outdated_wp():
     try:

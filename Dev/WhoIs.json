@@ -1,68 +1,59 @@
 {
-  "core": {
-    "current_version": "6.8.2",
-    "update_available": false,
-    "latest_version": null
-  },
-  "php_mysql": { "php_version": "8.2.12", "mysql_version": "10.4.32" },
-  "plugins": [
-    {
-      "name": "Akismet Anti-spam: Spam Protection",
-      "version": "5.4",
-      "active": false,
-      "update_available": true,
-      "latest_version": "5.5"
+  "status": "plugin update complete",
+  "result": {
+    "akismet/akismet.php": {
+      "source": "/opt/lampp/htdocs/TestWP/wp-content/upgrade/akismet.5.5-yPBxlh.xcf/akismet/",
+      "source_files": [
+        "class.akismet-rest-api.php",
+        "akismet.php",
+        "wrapper.php",
+        "class-akismet-compatible-plugins.php",
+        "class.akismet-widget.php",
+        "index.php",
+        "_inc",
+        "class.akismet-admin.php",
+        "class.akismet-cli.php",
+        "readme.txt",
+        "class.akismet.php",
+        ".htaccess",
+        "changelog.txt",
+        "views",
+        "LICENSE.txt"
+      ],
+      "destination": "/opt/lampp/htdocs/TestWP/wp-content/plugins/akismet/",
+      "destination_name": "akismet",
+      "local_destination": "/opt/lampp/htdocs/TestWP/wp-content/plugins",
+      "remote_destination": "/opt/lampp/htdocs/TestWP/wp-content/plugins/akismet/",
+      "clear_destination": true
     },
-    {
-      "name": "Hello Dolly",
-      "version": "1.7.2",
-      "active": false,
-      "update_available": false,
-      "latest_version": null
+    "hello.php": true,
+    "Basic-Auth/basic-auth.php": true,
+    "mainwp-child-reports/mainwp-child-reports.php": true,
+    "mainwp/mainwp.php": {
+      "source": "/opt/lampp/htdocs/TestWP/wp-content/upgrade/mainwp.5.4.0.17/mainwp/",
+      "source_files": [
+        "class",
+        "privacy-policy.txt",
+        "cron",
+        "templates",
+        "assets",
+        "includes",
+        "readme.txt",
+        "index.html",
+        "mainwp.php",
+        "mainwp-child-privacy-policy.txt",
+        "libs",
+        "languages",
+        "pages",
+        "widgets",
+        "modules"
+      ],
+      "destination": "/opt/lampp/htdocs/TestWP/wp-content/plugins/mainwp/",
+      "destination_name": "mainwp",
+      "local_destination": "/opt/lampp/htdocs/TestWP/wp-content/plugins",
+      "remote_destination": "/opt/lampp/htdocs/TestWP/wp-content/plugins/mainwp/",
+      "clear_destination": true
     },
-    {
-      "name": "MainWP Child Reports",
-      "version": "2.2.6",
-      "active": true,
-      "update_available": false,
-      "latest_version": null
-    },
-    {
-      "name": "MainWP Dashboard",
-      "version": "5.4.0.16",
-      "active": true,
-      "update_available": false,
-      "latest_version": null
-    },
-    {
-      "name": "ManageWP - Worker",
-      "version": "4.9.23",
-      "active": false,
-      "update_available": false,
-      "latest_version": null
-    }
-  ],
-  "themes": [
-    {
-      "name": "Twenty Twenty-Five",
-      "version": "1.3",
-      "active": true,
-      "update_available": false,
-      "latest_version": null
-    },
-    {
-      "name": "Twenty Twenty-Four",
-      "version": "1.3",
-      "active": false,
-      "update_available": false,
-      "latest_version": null
-    },
-    {
-      "name": "Twenty Twenty-Three",
-      "version": "1.6",
-      "active": false,
-      "update_available": false,
-      "latest_version": null
-    }
-  ]
+    "worker/init.php": true
+  }
 }

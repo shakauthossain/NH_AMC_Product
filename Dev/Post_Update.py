@@ -5,8 +5,7 @@ UPDATE_URL = "http://localhost/TestWP1/wp-json/custom/v1/update-plugins"
 AUTH = ("admin", "admin")  # Change to your real credentials
 
 # --- Plugins you NEVER want to update
-BLOCKLIST = {
-}
+BLOCKLIST = []
 
 
 def fetch_status():
@@ -57,20 +56,35 @@ def get_plugin_slug(plugin_dict):
 
 def perform_update(plugin_slugs):
     if not plugin_slugs:
-        print("🚫 No plugins selected for update.")
+        print("No plugins selected for update.")
         return
 
     payload = {"plugins": ",".join(plugin_slugs)}
     headers = {"Content-Type": "application/x-www-form-urlencoded"}
     res = requests.post(UPDATE_URL, auth=AUTH, data=payload, headers=headers)
-    print(res.text)  # raw output
-    print("👉 UPDATE_URL:", UPDATE_URL)
-    print("👉 Payload:", payload)
-    print("👉 Headers:", headers)
-    print("\n🚀 Update Triggered!")
+    # print(res.text)  # raw output
+    # print("UPDATE_URL:", UPDATE_URL)
+    # print("Payload:", payload)
+    # print("Headers:", headers)
+    # print("\nUpdate Triggered!")
     print(f"Status Code: {res.status_code}")
-    print("Response:")
-    print(res.json())
+    # print("Response:")
+    # print(res.json())
+    if res.status_code == 200:
+        print(str(payload) + "is Updated!")
+        # print("Plugins are Updated!")
+
+
+def update_wp_core():
+    url = "http://localhost/TestWP1/wp-json/custom/v1/update-core"
+    res = requests.post(url, auth=AUTH)
+    print("\n⚙️ WordPress Core Update Triggered")
+    print("Status:", res.status_code)
+    try:
+        print(res.json())
+    except:
+        print("Raw:", res.text)
+
 
 
 if __name__ == "__main__":
