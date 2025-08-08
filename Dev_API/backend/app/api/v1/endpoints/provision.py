@@ -3,7 +3,7 @@ from pydantic import BaseModel, Field, EmailStr
 from uuid import uuid4
 from app.workers.tasks import provision_wordpress_task
 
-router = APIRouter(prefix="/api/v1")
+router = APIRouter()
 
 class ProvisionRequest(BaseModel):
     ssh_host: str = Field(..., example="192.168.1.100")
@@ -28,11 +28,8 @@ def provision_server(payload: ProvisionRequest, background_tasks: BackgroundTask
     """
     try:
         task_id = str(uuid4())
-        background_tasks.add_task(
-            provision_wordpress_task,
-            task_id=task_id,
-            payload=payload.dict()
-        )
+        provision_wordpress_task.delay(task_id=task_id, payload=payload.dict())
+        # background_tasks.add_task(provision_wordpress_task, task_id, payload.dict())
         return ProvisionResponse(
             status="provisioning_started",
             task_id=task_id,

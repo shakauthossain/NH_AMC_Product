@@ -1,10 +1,13 @@
 import os
-from pydantic import BaseSettings, Field, EmailStr
-
+from pydantic import Field, EmailStr
+from pydantic_settings import BaseSettings
 
 class Settings(BaseSettings):
     PROJECT_NAME: str = "WordPress VPS Provisioner"
     API_V1_PREFIX: str = "/api/v1"
+
+    # Database
+    DATABASE_URL: str = Field(..., env="DATABASE_URL")
 
     # Redis for Celery
     REDIS_URL: str = Field("redis://localhost:6379/0", env="REDIS_URL")
@@ -18,6 +21,5 @@ class Settings(BaseSettings):
 
     class Config:
         env_file = ".env"
-
 
 settings = Settings()

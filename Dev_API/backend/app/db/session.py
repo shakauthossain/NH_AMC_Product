@@ -1,14 +1,14 @@
+from typing import Iterator
 from sqlalchemy import create_engine
-from sqlalchemy.orm import sessionmaker
+from sqlalchemy.orm import sessionmaker, Session
 from app.core.config import settings
 
-# Example: postgresql://user:password@localhost/dbname
-DATABASE_URL = settings.DATABASE_URL
+# Engine & factory
+engine = create_engine(settings.DATABASE_URL, future=True)
+SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False, future=True)
 
-engine = create_engine(DATABASE_URL)
-SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
-
-def get_session():
+# ➜ Use this in FastAPI endpoints via Depends(get_session)
+def get_session() -> Iterator[Session]:
     db = SessionLocal()
     try:
         yield db

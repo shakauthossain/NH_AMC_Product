@@ -1,10 +1,9 @@
 from celery import Celery
+from sqlalchemy.orm import Session
 from app.services.provision_service import run_provision_script
 from app.services.email_service import send_provisioning_report
 from app.db.models.task_log import TaskLog
-from app.db.session import get_session
-from sqlalchemy.orm import Session
-from datetime import datetime
+from app.db.session import SessionLocal  # <-- use SessionLocal here
 
 celery_app = Celery(
     "tasks",
@@ -14,14 +13,9 @@ celery_app = Celery(
 
 @celery_app.task(name="provision_wordpress_task")
 def provision_wordpress_task(task_id: str, payload: dict):
-    """
-    Task to provision a WordPress site on a remote VPS using SSH.
-    Tracks status and output in the database.
-    """
-    db: Session = get_session()
+    db: Session = SessionLocal()
+    task_log = TaskLog(task_id=task_id, status="in_progress")
     try:
-        # Create initial task record
-        task_log = TaskLog(task_id=task_id, status="in_progress")
         db.add(task_log)
         db.commit()
 
@@ -54,13 +48,14 @@ def provision_wordpress_task(task_id: str, payload: dict):
 
         task_log.status = "completed"
         task_log.output = output
+        db.add(task_log)
+        db.commit()
 
     except Exception as e:
         task_log.status = "failed"
         task_log.output = str(e)
-        print(f"[ERROR] Task {task_id} failed: {str(e)}")
-
-    finally:
         db.add(task_log)
         db.commit()
+        raise
+    finally:
         db.close()

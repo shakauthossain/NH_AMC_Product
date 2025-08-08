@@ -8,7 +8,14 @@ def ssh_connect(host: str, username: str, password: str) -> paramiko.SSHClient:
     """
     client = paramiko.SSHClient()
     client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-    client.connect(hostname=host, username=username, password=password, timeout=10)
+    client.connect(
+        hostname=host,
+        username=username,
+        password=password,
+        timeout=15,
+        auth_timeout=15,
+        banner_timeout=15,
+    )
     return client
 
 
