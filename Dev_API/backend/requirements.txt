@@ -23,6 +23,5 @@ email-validator==2.1.0.post1
 httpx==0.27.0
 pytest==8.2.1
 
-# If using Alembic for migrations (recommended)
-# If using Jupyter for notebooks
 jupyter==1.0.0
+psycopg2-binary

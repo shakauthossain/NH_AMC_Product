@@ -37,3 +37,10 @@ def ssh_upload_file(client: paramiko.SSHClient, local_path: str, remote_path: st
     ftp_client = client.open_sftp()
     ftp_client.put(local_path, remote_path)
     ftp_client.close()
+
+# app/utils/ssh_utils.py
+def put_text(self, content: str, remote_path: str):
+    import io, stat
+    with self.sftp_client.open(remote_path, 'w') as f:
+        f.write(content)
+    self.sftp_client.chmod(remote_path, 0o700)

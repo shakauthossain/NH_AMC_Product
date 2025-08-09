@@ -59,3 +59,14 @@ def provision_wordpress_task(task_id: str, payload: dict):
         raise
     finally:
         db.close()
+        
+from celery import shared_task
+from app.services.reset_service import ResetService
+from uuid import uuid4
+
+@shared_task(bind=True)
+def reset_droplet_task(self, req_dict):
+    from app.services.reset_service import ResetService
+    svc = ResetService()
+    task_id = getattr(self.request, "id", None) or f"inline-{uuid4().hex}"
+    return svc.execute(task_id, req_dict)
