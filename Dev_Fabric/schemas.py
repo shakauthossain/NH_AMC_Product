@@ -4,13 +4,15 @@ from typing import Optional, List, Dict, Any
 class SiteConfig(BaseModel):
     host: str
     user: str
-    key_filename: Optional[str] = None       # was required before
-    private_key_pem: Optional[str] = None    # <— NEW (mirror SiteConnection)
-    password: Optional[str] = None           # <— NEW
+    key_filename: Optional[str] = None
+    private_key_pem: Optional[str] = None
+    password: Optional[str] = None
+    sudo_password: Optional[str] = None   # NEW
     wp_path: str
     db_name: str
     db_user: str
     db_pass: str
+    port: Optional[int] = 22
 
 class SSLCheckRequest(BaseModel):
     domain: str
@@ -27,12 +29,13 @@ class WPStatusResponse(BaseModel):
     themes: List[dict] = Field(default_factory=list)
     
 class SiteConnection(BaseModel):
-    host: str
+    host: Optional[str] = None
     user: str
     key_filename: Optional[str] = None
     private_key_pem: Optional[str] = None
-    password: Optional[str] = None          # <— NEW
+    password: Optional[str] = None
     wp_path: str = "/var/www/html"
+    port: Optional[int] = 22
 
 class SiteIdResponse(BaseModel):
     site_id: str

@@ -1,18 +1,15 @@
-from fabric import Connection
+from fabric import Connection, Config
 import tempfile, os, stat
 
 def _materialize_key(site: dict) -> str | None:
-    # If a PEM is provided, write it to a temp file (600) and return its path
     if site.get("private_key_pem"):
         fd, path = tempfile.mkstemp(prefix="sshkey_", text=True)
         with os.fdopen(fd, "w") as f:
             f.write(site["private_key_pem"])
-        os.chmod(path, stat.S_IRUSR | stat.S_IWUSR)  # 600
+        os.chmod(path, stat.S_IRUSR | stat.S_IWUSR)
         return path
-    # If a key file path is provided, use it
     if site.get("key_filename"):
         return site["key_filename"]
-    # Otherwise (password auth), no key file
     return None
 
 def _connect_kwargs(site: dict) -> dict:
@@ -20,22 +17,46 @@ def _connect_kwargs(site: dict) -> dict:
     key_path = _materialize_key(site)
     if key_path:
         kw["key_filename"] = key_path
-        # optional: kw["allow_agent"] = False; kw["look_for_keys"] = False
+        # make behavior deterministic
+        kw["allow_agent"] = False
+        kw["look_for_keys"] = False
     elif site.get("password"):
         kw["password"] = site["password"]
-        # optional: kw["allow_agent"] = False; kw["look_for_keys"] = False
+        # critical for password auth
+        kw["allow_agent"] = False
+        kw["look_for_keys"] = False
+        # be generous with banners/timeouts
+        kw["banner_timeout"] = 60
+        kw["auth_timeout"] = 30
     return kw
+
+def _conn_params(site: dict) -> dict:
+    cfg = Config(overrides={"sudo": {"password": site.get("sudo_password") or site.get("password")}})
+    params = {
+        "host": site["host"],
+        "user": site["user"],
+        "connect_kwargs": _connect_kwargs(site),
+        "connect_timeout": 30,
+        "config": cfg,                         # pass sudo password here
+    }
+    if site.get("port"): params["port"] = site["port"]
+    return params
+
+def _normalize_site(site: dict) -> dict:
+    site = dict(site)  # shallow copy
+    if not site.get("sudo_password") and site.get("password"):
+        site["sudo_password"] = site["password"]
+    return site
 
 def run_fabric_task(site, task_name, **kwargs):
     import fabric_tasks as ft
     func = getattr(ft, task_name)
+    site = _normalize_site(site)  # <— add this
     key_created = bool(site.get("private_key_pem"))
-    key_path = None
-    kw = _connect_kwargs(site)
-    key_path = kw.get("key_filename")
-
+    key_path = _materialize_key(site)
+    params = _conn_params(site)
     try:
-        with Connection(host=site["host"], user=site["user"], connect_kwargs=kw) as c:
+        with Connection(**params) as c:
             return func(c, **kwargs)
     finally:
         if key_created and key_path:
@@ -43,31 +64,19 @@ def run_fabric_task(site, task_name, **kwargs):
             except Exception: pass
 
 def verify_ssh(site: dict) -> dict:
+    site = _normalize_site(site) 
     key_created = bool(site.get("private_key_pem"))
-    kw = _connect_kwargs(site)
-    key_path = kw.get("key_filename")
+    key_path = _materialize_key(site)
+    params = _conn_params(site)
     try:
-        with Connection(host=site["host"], user=site["user"], connect_kwargs=kw) as c:
+        with Connection(**params) as c:
             r = c.run("echo ok && uname -a", hide=True, warn=False)
             return {"ok": r.ok, "stdout": r.stdout.strip()}
     finally:
         if key_created and key_path:
             try: os.remove(key_path)
             except Exception: pass
-    key_path = _materialize_key(site)
-    try:
-        with Connection(
-            host=site["host"],
-            user=site["user"],
-            connect_kwargs={"key_filename": key_path}
-        ) as c:
-            # lightweight command to prove it works
-            r = c.run("echo ok && uname -a", hide=True, warn=False)
-            return {"ok": r.ok, "stdout": r.stdout.strip()}
-    finally:
-        if site.get("private_key_pem"):
-            try: os.remove(key_path)
-            except Exception: pass
+
             
 def _tool_exists(c, cmd):
     return c.local(f"command -v {cmd}", hide=True, warn=True).ok

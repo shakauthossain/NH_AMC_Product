@@ -1,0 +1,11 @@
+fastapi
+uvicorn[standard]
+celery
+redis
+pydantic
+pydantic-settings
+python-multipart
+fabric
+invoke
+paramiko
+email-validator

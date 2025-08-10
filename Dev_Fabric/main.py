@@ -48,6 +48,7 @@ def root():
 
 @app.post("/tasks/backup", response_model=TaskEnqueueResponse)
 def trigger_backup(site: SiteConfig):
+    site.user = "root"  # <--
     task = run_site_task.delay(site.dict(), "backup_site",
                                wp_path=site.wp_path, db_name=site.db_name,
                                db_user=site.db_user, db_pass=site.db_pass)
@@ -55,11 +56,13 @@ def trigger_backup(site: SiteConfig):
 
 @app.post("/tasks/wp-status", response_model=TaskEnqueueResponse)
 def trigger_wp_status(site: SiteConfig):
+    site.user = "root"  # <--
     task = run_site_task.delay(site.dict(), "wp_status", wp_path=site.wp_path)
     return {"task_id": task.id, "status": "queued"}
 
 @app.post("/tasks/update", response_model=TaskEnqueueResponse)
 def trigger_update(site: SiteConfig):
+    site.user = "root"  # <--
     task = run_site_task.delay(site.dict(), "update_with_rollback",
                                wp_path=site.wp_path, db_name=site.db_name,
                                db_user=site.db_user, db_pass=site.db_pass)
@@ -67,30 +70,30 @@ def trigger_update(site: SiteConfig):
 
 @app.post("/tasks/ssl-expiry", response_model=TaskEnqueueResponse)
 def trigger_ssl(req: SSLCheckRequest, site: SiteConfig):
+    site.user = "root"  # <--
     task = run_site_task.delay(site.dict(), "ssl_expiry", domain=req.domain)
     return {"task_id": task.id, "status": "queued"}
 
 @app.post("/tasks/healthcheck", response_model=TaskEnqueueResponse)
 def trigger_health(req: HealthcheckRequest, site: SiteConfig):
-    task = run_site_task.delay(
-        site.dict(),
-        "healthcheck",
-        url=req.url,
-        keyword=req.keyword,
-        screenshot=req.screenshot,
-        out_path=req.out_path
-    )
+    site.user = "root"  # <--
+    task = run_site_task.delay(site.dict(), "healthcheck",
+                               url=req.url, keyword=req.keyword,
+                               screenshot=req.screenshot, out_path=req.out_path)
     return {"task_id": task.id, "status": "queued"}
 
 @app.post("/ssh/login", response_model=SiteIdResponse, summary="Verify SSH and create a site session")
 def ssh_login(conn: SiteConnection):
     site = conn.dict()
+    site["user"] = "root"               
     check = verify_ssh(site)
     if not check.get("ok"):
         raise HTTPException(status_code=400, detail="SSH verification failed")
     site_id = str(uuid.uuid4())
-    SITES[site_id] = site
+    SITES[site_id] = site      
+    site["user"] = "root"       
     return {"site_id": site_id, "verified": True}
+
 
 @app.get("/sites/{site_id}")
 def get_site(site_id: str):
@@ -105,8 +108,9 @@ def trigger_wp_install(site_id: str, req: WPInstallRequest):
     site = SITES.get(site_id)
     if not site:
         raise HTTPException(status_code=404, detail="Unknown site_id")
+    site_for_task = {**site, "user": "root"}  
     task = run_site_task.delay(
-        site, "provision_wp_sh",
+        site_for_task, "provision_wp_sh",
         report_email=req.report_email,
         domain=req.domain,
         wp_path=req.wp_path,
@@ -122,6 +126,7 @@ def trigger_wp_install(site_id: str, req: WPInstallRequest):
     )
     return {"task_id": task.id, "status": "queued"}
 
+
 @app.get("/tasks/{task_id}", response_model=TaskResultResponse)
 def get_task(task_id: str):
     res = AsyncResult(task_id, app=celery)
@@ -134,7 +139,9 @@ def get_task(task_id: str):
 
 @app.post("/tasks/wp-reset", response_model=TaskEnqueueResponse, summary="Hard reset the droplet to a clean state")
 def trigger_wp_reset(req: WPResetRequest, site: SiteConfig, _ok: bool = Depends(require_reset_token)):
+    site.user = "root"
     task = run_site_task.delay(
+        
         site.dict(),
         "wp_reset_sh",
         wp_path=req.wp_path,
@@ -145,3 +152,4 @@ def trigger_wp_reset(req: WPResetRequest, site: SiteConfig, _ok: bool = Depends(
         report_path=req.report_path
     )
     return {"task_id": task.id, "status": "queued"}
+

@@ -2,6 +2,8 @@ from fabric import task
 from invoke.exceptions import UnexpectedExit
 import json, datetime, tempfile, os
 from task_runner import _take_screenshot, _tool_exists
+from pathlib import Path
+from shlex import quote as Q
 
 def wp(c, path, cmd):
     return c.run(f"cd {path} && wp {cmd}", hide=True, warn=True)
@@ -66,17 +68,42 @@ def provision_wp_sh(c, domain, wp_path="/var/www/html", site_title="My Site",
                     db_name="wp_db", db_user="wp_user", db_pass="wp_pass",
                     php_version="8.1", wp_version="latest",
                     letsencrypt_email="", noninteractive="true"):
+    """
+    Runs the provisioning shell script on the remote host and returns the JSON report.
+    - Uploads script from this module's directory.
+    - Uses sudo only when needed (i.e., when not root).
+    - Reads the report without sudo to avoid prompt failures.
+    """
+    # Always upload the script from the project folder where this file lives
+    local_script = Path(__file__).parent / "wp_provision.sh"
     remote_script = "/tmp/wp_provision.sh"
-    c.put("wp_provision.sh", remote_script)
-    c.sudo(f"chmod +x {remote_script}")
     report_path = "/tmp/wp_provision_report.json"
+
+    c.put(str(local_script), remote_script)
+
+    # Make executable
+    if c.user == "root":
+        c.run(f"chmod +x {remote_script}", warn=True)
+    else:
+        c.sudo(f"chmod +x {remote_script}", warn=True)
+
+    # Build command (quote everything that can contain spaces/special chars)
     cmd = (
-        f"{remote_script} {domain} {wp_path} '{site_title}' {admin_user} '{admin_pass}' {admin_email} "
-        f"{db_name} {db_user} '{db_pass}' {php_version} {wp_version} {report_path} {letsencrypt_email} {noninteractive}"
+        f"{remote_script} "
+        f"{Q(domain)} {Q(wp_path)} {Q(site_title)} {Q(admin_user)} {Q(admin_pass)} {Q(admin_email)} "
+        f"{Q(db_name)} {Q(db_user)} {Q(db_pass)} {Q(php_version)} {Q(wp_version)} {Q(report_path)} "
+        f"{Q(letsencrypt_email)} {Q(noninteractive)}"
     )
-    r = c.sudo(cmd, warn=True)
-    out = c.sudo(f"cat {report_path}", hide=True).stdout
-    return json.loads(out)
+
+    # Execute script
+    runner = c.run if c.user == "root" else c.sudo
+    runner(cmd, warn=True)
+
+    # Read report WITHOUT sudo (script chmods it 0644; error trap writes on failure)
+    out = c.run(f"cat {report_path}", hide=True, warn=False).stdout
+
+    return json.loads(out or "{}")
+
 
 @task
 def update_with_rollback(c, wp_path, db_name, db_user, db_pass, out_dir="/tmp/backups"):
@@ -158,8 +185,18 @@ def wp_reset_sh(c,
     cmd = " ".join([remote_script] + [str(x) for x in flags])
     c.sudo(cmd, warn=True)
 
-    out = c.sudo(f"cat {report_path}", hide=True).stdout
+    out = c.run(f"cat {report_path}", hide=True).stdout
     try:
         return json.loads(out)
     except Exception:
         return {"status": "unknown", "raw": out.strip()}
+    
+@task
+def wp_diag_log(c, log_path="/var/log/wp_provision.log"):
+    return {
+        "whoami": c.run("whoami", hide=True).stdout.strip(),
+        "php": c.run("php -v | head -n1", hide=True, warn=True).stdout.strip(),
+        "mysql": c.run("systemctl is-active mysql || true", hide=True).stdout.strip(),
+        "nginx_test": c.run("nginx -t 2>&1 || true", hide=True).stdout,
+        "tail": c.run(f"tail -n 200 {log_path} || echo 'log missing'", hide=True).stdout,
+    }
