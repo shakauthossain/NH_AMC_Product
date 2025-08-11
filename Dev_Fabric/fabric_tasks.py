@@ -163,33 +163,65 @@ def update_with_rollback(c, wp_path, db_name, db_user, db_pass, out_dir="/tmp/ba
         }
         
 @task
-def wp_reset_sh(c,
-                wp_path: str | None = None,
-                domain: str | None = None,
-                purge_stack: bool = True,
-                reset_ufw: bool = True,
-                force: bool = True,
-                report_path: str = "/tmp/wp_rollback_report.json"):
+def wp_reset_sh(
+    c,
+    wp_path: str | None = None,              # ignored by script, kept for API compat
+    domain: str | None = None,               # ignored by script, kept for API compat
+    purge_stack: bool = True,                # script always purges; no flag needed
+    reset_ufw: bool = True,
+    force: bool = True,
+    report_path: str = "/tmp/droplet_reset_report.json"  # match script default
+):
+    """
+    Upload and run wp_reset.sh which supports only:
+      --force, --no-ufw, --no-reboot
+    Script writes report to /tmp/droplet_reset_report.json.
+    """
+    # Resolve local script reliably (don't depend on CWD)
+    local_script = Path(__file__).parent / "wp_reset.sh"
     remote_script = "/tmp/wp_reset.sh"
-    c.put("wp_reset.sh", remote_script)
+
+    c.put(str(local_script), remote_script)
     c.sudo(f"chmod +x {remote_script}")
 
-    flags = []
-    if wp_path:     flags += ["--path", wp_path]
-    if domain:      flags += ["--domain", domain]
-    if report_path: flags += ["--report", report_path]
-    if force:       flags += ["--force"]
-    if purge_stack: flags += ["--purge-stack"]
-    if reset_ufw:   flags += ["--reset-ufw"]
+    flags: list[str] = []
+    if force:
+        flags.append("--force")
+    # Our API provides reset_ufw=True to mean "reset firewall".
+    # Script uses --no-ufw to SKIP firewall work, so invert accordingly.
+    if not reset_ufw:
+        flags.append("--no-ufw")
 
-    cmd = " ".join([remote_script] + [str(x) for x in flags])
-    c.sudo(cmd, warn=True)
+    # (Optional) Avoid surprise reboot; uncomment if you want no reboot by default:
+    # flags.append("--no-reboot")
 
-    out = c.run(f"cat {report_path}", hide=True).stdout
+    cmd = " ".join([remote_script] + flags)
+    r = c.sudo(cmd, warn=True)
+
+    # Try requested report_path first (if user changed it in future script versions),
+    # then fall back to the script's current default path.
+    default_report = "/tmp/droplet_reset_report.json"
+    candidates = [report_path or default_report]
+    if default_report not in candidates:
+        candidates.append(default_report)
+
+    out = ""
+    last_err = None
+    for p in candidates:
+        try:
+            out = c.run(f"cat {p}", hide=True, warn=False).stdout
+            if out:
+                break
+        except Exception as e:
+            last_err = e
+
+    if not out:
+        return {"status": "unknown", "error": f"report not found", "tried": candidates, "exec_ok": r.ok}
+
     try:
         return json.loads(out)
     except Exception:
-        return {"status": "unknown", "raw": out.strip()}
+        return {"status": "unknown", "raw": out.strip(), "parsed": False}
     
 @task
 def wp_diag_log(c, log_path="/var/log/wp_provision.log"):
@@ -200,3 +232,35 @@ def wp_diag_log(c, log_path="/var/log/wp_provision.log"):
         "nginx_test": c.run("nginx -t 2>&1 || true", hide=True).stdout,
         "tail": c.run(f"tail -n 200 {log_path} || echo 'log missing'", hide=True).stdout,
     }
+
+@task
+def wp_finalize_install(c, wp_path, url, title, admin_user, admin_pass, admin_email, locale="en_US"):
+    def wp(cmd): return c.run(f"cd {wp_path} && sudo -u www-data wp {cmd}", hide=True, warn=True)
+
+    # Ensure WP-CLI present
+    if not c.run("command -v /usr/local/bin/wp", hide=True, warn=True).ok:
+        c.sudo("curl -sSLo /usr/local/bin/wp https://raw.githubusercontent.com/wp-cli/builds/gh-pages/phar/wp-cli.phar", warn=True)
+        c.sudo("chmod +x /usr/local/bin/wp", warn=True)
+
+    # If config missing, create it (assumes DB is ready and wp-config values are known)
+    if not c.run(f"test -f {wp_path}/wp-config.php", hide=True, warn=True).ok:
+        return {"ok": False, "error": "wp-config.php missing; run full provision or supply DB vars in a dedicated task."}
+
+    # Install core if not already installed
+    if not wp("core is-installed").ok:
+        r = wp(f'core install --skip-email --url="{url}" --title="{title}" '
+               f'--admin_user="{admin_user}" --admin_password="{admin_pass}" --admin_email="{admin_email}"')
+        if not r.ok:
+            return {"ok": False, "error": "core install failed", "stdout": r.stdout, "stderr": r.stderr}
+
+    # Language (install + activate)
+    if locale and locale != "en_US":
+        wp(f"language core install {locale}")
+        wp(f"language core activate {locale}")
+
+    # Basic hardening / nice defaults
+    wp('option update blog_public 0')
+    wp('rewrite structure "/%postname%/" && wp rewrite flush --hard')
+
+    v = wp("core version").stdout.strip()
+    return {"ok": True, "wordpress_version": v, "locale": locale}

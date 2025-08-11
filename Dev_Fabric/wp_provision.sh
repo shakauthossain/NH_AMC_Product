@@ -3,10 +3,10 @@
 # - Auto-detect/skip existing Nginx/MySQL/PHP-FPM
 # - Repairs dpkg before installs; uses apt-get everywhere (noninteractive-safe)
 # - Purges MariaDB remnants to avoid conflicts
-# - MySQL self-heal: ensures /var/run/mysqld, minimal config, initializes datadir if needed
+# - MySQL self-heal; initializes datadir if needed
 # - PHP install: generic meta first, then 8.4→8.3→8.2→8.1 fallback
 # - Dynamic PHP-FPM socket detection + stable symlinks
-# - WP-CLI with install retries, JSON report, never hard-fails orchestrator
+# - Headless WP install with retries, forced en_US, JSON report
 
 # -------------------- Inputs (positional) --------------------
 DOMAIN="${1:-}"                     # optional ("")
@@ -23,6 +23,7 @@ WP_VERSION="${11:-latest}"
 REPORT_PATH="${12:-/tmp/wp_provision_report.json}"
 LETSENCRYPT_EMAIL="${13:-}"         # used only if DOMAIN set
 NONINTERACTIVE="${14:-true}"        # "true" or "false"
+LOCALE="en_US"                      # always force English
 
 # -------------------- Basics --------------------
 log()  { echo -e "\033[1;32m==>\033[0m $*"; }
@@ -65,7 +66,6 @@ service_active(){
 }
 
 repair_dpkg(){
-  # Heal half-configured packages so future apt steps don't fail
   safe dpkg --configure -a
   safe apt-get -f install -y
 }
@@ -92,14 +92,12 @@ apt_update_resilient(){
 }
 
 install_php_any(){
-  # Try generic meta first
   if apt-get install -y php-fpm php-cli php-mysql php-xml php-curl php-zip php-gd php-mbstring php-intl >/tmp/.php_install.log 2>&1; then
     PHP_EFF_VER="$(php -r 'echo PHP_MAJOR_VERSION.".".PHP_MINOR_VERSION;' 2>/dev/null || echo "")"
     [ -n "$PHP_EFF_VER" ] || PHP_EFF_VER="system"
     systemctl enable --now "php${PHP_EFF_VER}-fpm" >/dev/null 2>&1 || true
     return 0
   fi
-  # Try explicit versions regardless of apt-cache visibility
   for v in 8.4 8.3 8.2 8.1; do
     if apt-get install -y "php${v}-fpm" "php${v}-cli" "php${v}-mysql" "php${v}-xml" "php${v}-curl" \
                           "php${v}-zip" "php${v}-gd" "php${v}-mbstring" "php${v}-intl" >/tmp/.php_install.log 2>&1; then
@@ -122,9 +120,12 @@ php_ini_tune(){
 }
 
 wp_bin="/usr/local/bin/wp"
-wp(){
-  su -s /bin/bash - www-data -c "cd '$WP_PATH' && $wp_bin $*"
-}
+
+# Optional legacy helper (not used below anymore but harmless to keep)
+wp(){ su -s /bin/bash - www-data -c "cd '$WP_PATH' && $wp_bin $*"; }
+
+# New: always pass explicit --path and run as www-data
+wp_run(){ su -s /bin/bash - www-data -c "$wp_bin --path='$WP_PATH' $*"; }
 
 ensure_wpcli(){
   if command -v "$wp_bin" >/dev/null 2>&1; then return 0; fi
@@ -137,15 +138,15 @@ wp_core_install_with_retries(){
   local url="$1" title="$2" user="$3" pass="$4" email="$5"
   local tries=3 i=1
   while :; do
-    if wp core is-installed >/dev/null 2>&1; then return 0; fi
-    if wp core install --skip-email \
+    if wp_run core is-installed >/dev/null 2>&1; then return 0; fi
+    if wp_run core install --skip-email \
        --url="$url" --title="$title" \
        --admin_user="$user" --admin_password="$pass" --admin_email="$email" \
        >/tmp/.wp_install.log 2>&1; then
       return 0
     fi
     if [ $i -ge $tries ]; then
-      wp core is-installed >/dev/null 2>&1 && return 0
+      wp_run core is-installed >/dev/null 2>&1 && return 0
       return 1
     fi
     sleep 5
@@ -160,7 +161,6 @@ detect_php_version(){
 }
 
 detect_php_sock(){
-  # Prefer versioned socket, then any versioned, then generic
   local s
   if [ -n "$PHP_EFF_VER" ] && [ -S "/run/php/php${PHP_EFF_VER}-fpm.sock" ]; then
     echo "/run/php/php${PHP_EFF_VER}-fpm.sock"; return 0
@@ -173,7 +173,6 @@ detect_php_sock(){
 
 # -------------------- Start --------------------
 [ "${NONINTERACTIVE,,}" = "true" ] && export DEBIAN_FRONTEND=noninteractive
-
 log "Ubuntu $UBU_VER ($CODENAME) — starting safe provision (MySQL, v6.2)"
 
 # Preflight repair + apt update
@@ -186,7 +185,7 @@ safe ufw allow OpenSSH
 safe ufw --force enable
 S_UFW="enabled"
 
-# -------------------- Nginx: detect or install --------------------
+# -------------------- Nginx --------------------
 if command -v nginx >/dev/null 2>&1 || service_active nginx; then
   log "Nginx already present — skipping install."
   S_NGINX="ok"
@@ -205,25 +204,16 @@ fi
 [ "$S_NGINX" = "ok" ] && safe ufw allow 'Nginx Full'
 
 # -------------------- MySQL (no MariaDB) --------------------
-# Always purge MariaDB remnants first to avoid conflicts
 safe apt-get purge -y mariadb-server mariadb-client mariadb-common libmariadb* libdbd-mariadb-perl
-
 if command -v mysql >/dev/null 2>&1 || service_active mysql; then
   log "MySQL already present — ensuring it's enabled and running."
   safe systemctl enable --now mysql
 else
   log "Installing MySQL Server (self-heal enabled)…"
-
-  # Self-heal preconditions BEFORE install
   repair_dpkg
   apt_update_resilient
-
-  # Ensure runtime dir exists and is owned properly
   safe install -o mysql -g mysql -m 755 -d /var/run/mysqld
-  # Ensure data dir exists (ownership set below as needed)
   safe install -o mysql -g mysql -m 700 -d /var/lib/mysql
-
-  # Minimal config that won't conflict with defaults (placed last)
   if [ ! -f /etc/mysql/mysql.conf.d/zz-minimal.cnf ]; then
     cat >/etc/mysql/mysql.conf.d/zz-minimal.cnf <<'CNF'
 [mysqld]
@@ -233,29 +223,18 @@ pid-file=/var/run/mysqld/mysqld.pid
 bind-address=127.0.0.1
 CNF
   fi
-
-  # Install MySQL
-  if apt-get install -y --no-install-recommends mysql-server mysql-client >/tmp/.mysql_install.log 2>&1; then
-    :
-  else
-    mark_warn "MySQL install problem (see /tmp/.mysql_install.log)"
-  fi
+  apt-get install -y --no-install-recommends mysql-server mysql-client >/tmp/.mysql_install.log 2>&1 || mark_warn "MySQL install problem (see /tmp/.mysql_install.log)"
 fi
 
-# If system tables missing (fresh or nuked box), initialize insecure data dir
 if [ ! -d /var/lib/mysql/mysql ]; then
   warn "MySQL system tables not found; initializing data directory…"
   safe mysqld --initialize-insecure --user=mysql --datadir=/var/lib/mysql >/tmp/.mysql_init.log 2>&1
   safe chown -R mysql:mysql /var/lib/mysql
 fi
 
-# Start MySQL and wait
 safe systemctl daemon-reload
 safe systemctl enable --now mysql
-for i in {1..30}; do
-  mysqladmin ping --silent >/dev/null 2>&1 && break
-  sleep 1
-done
+for i in {1..30}; do mysqladmin ping --silent >/dev/null 2>&1 && break; sleep 1; done
 
 if command -v mysql >/dev/null 2>&1 && mysqladmin ping --silent >/dev/null 2>&1; then
   mysql -u root <<SQL >/dev/null 2>&1 || true
@@ -269,7 +248,7 @@ else
   mark_warn "MySQL unavailable after install/start (see /tmp/.mysql_install.log and journalctl -u mysql)"
 fi
 
-# -------------------- PHP: detect or install --------------------
+# -------------------- PHP --------------------
 detect_php_version
 if [ -n "$PHP_EFF_VER" ] && (service_active "php${PHP_EFF_VER}-fpm" || ls /run/php/php*-fpm.sock >/dev/null 2>&1); then
   log "PHP-FPM already present (PHP ${PHP_EFF_VER}) — skipping install."
@@ -282,19 +261,14 @@ else
     php_ini_tune
     S_PHP="ok"
   else
-    S_PHP="skipped"
-    mark_warn "Host PHP could not be installed (see /tmp/.php_install.log)"
+    S_PHP="skipped"; mark_warn "Host PHP could not be installed (see /tmp/.php_install.log)"
   fi
 fi
 detect_php_version
 
-# Ensure PHP-FPM socket is ready and create stable symlinks
 if [ -n "$PHP_EFF_VER" ]; then
   safe systemctl enable --now "php${PHP_EFF_VER}-fpm"
-  for i in {1..20}; do
-    [ -S "/run/php/php${PHP_EFF_VER}-fpm.sock" ] && break
-    sleep 1
-  done
+  for i in {1..20}; do [ -S "/run/php/php${PHP_EFF_VER}-fpm.sock" ] && break; sleep 1; done
   if [ -S "/run/php/php${PHP_EFF_VER}-fpm.sock" ]; then
     ln -sf "/run/php/php${PHP_EFF_VER}-fpm.sock" /etc/alternatives/php-fpm.sock
     ln -sf /etc/alternatives/php-fpm.sock /run/php/php-fpm.sock
@@ -321,10 +295,7 @@ if [ "$S_NGINX" = "ok" ] && [ "$S_PHP" = "ok" ]; then
   NGX_AV="/etc/nginx/sites-available/${SITENAME}"
   NGX_EN="/etc/nginx/sites-enabled/${SITENAME}"
   PHP_SOCK="$(detect_php_sock)"
-
-  if [ -z "$PHP_SOCK" ]; then
-    mark_warn "PHP-FPM socket not found; Nginx fastcgi_pass may need manual fix"
-  fi
+  [ -z "$PHP_SOCK" ] && mark_warn "PHP-FPM socket not found; Nginx fastcgi_pass may need manual fix"
 
   log "Creating Nginx server block (${SITENAME})…"
   cat > "$NGX_AV" <<NGX
@@ -364,7 +335,7 @@ fi
 # -------------------- WordPress --------------------
 log "Provisioning WordPress…"
 
-# SITE_URL
+# SITE_URL (needed for headless install)
 if [ -n "$DOMAIN" ]; then
   SITE_URL="http://$DOMAIN"
 else
@@ -375,37 +346,45 @@ fi
 INSTALL_WARN=""
 
 if command -v "$wp_bin" >/dev/null 2>&1; then
-  # Download core
+  # (a) Download core if missing
   if [ ! -f "$WP_PATH/wp-load.php" ]; then
     if [ "$WP_VERSION" = "latest" ]; then
-      wp core download >/tmp/.wp_core_download.log 2>&1 || mark_warn "WP core download failed"
+      wp_run core download >/tmp/.wp_core_download.log 2>&1 || mark_warn "WP core download failed"
     else
-      wp core download --version="$WP_VERSION" >/tmp/.wp_core_download.log 2>&1 || mark_warn "WP core download ($WP_VERSION) failed"
+      wp_run core download --version="$WP_VERSION" >/tmp/.wp_core_download.log 2>&1 || mark_warn "WP core download ($WP_VERSION) failed"
     fi
   fi
 
-  # Config DB (only if MySQL ready)
+  # (b) Create wp-config.php when DB is ready
   if [ "$S_DB" = "ok" ]; then
     DB_MODE="mysql"
     if [ ! -f "$WP_PATH/wp-config.php" ]; then
-      wp config create --dbname="$DB_NAME" --dbuser="$DB_USER" --dbpass="$DB_PASS" --dbhost="localhost" --skip-check >/tmp/.wp_config.log 2>&1 || mark_warn "wp-config create failed"
+      wp_run config create --dbname="$DB_NAME" --dbuser="$DB_USER" --dbpass="$DB_PASS" --dbhost="localhost" --skip-check \
+        >/tmp/.wp_config.log 2>&1 || mark_warn "wp-config create failed"
     fi
   else
     INSTALL_WARN="Database not ready; WordPress install will be retried on next run."
   fi
 
-  # Install WP (only if PHP + DB OK)
+  # (c) Headless install if PHP + DB OK and not installed yet
   if [ "$S_PHP" = "ok" ] && [ "$S_DB" = "ok" ]; then
-    if ! wp core is-installed >/dev/null 2>&1; then
+    if ! wp_run core is-installed >/dev/null 2>&1; then
       if ! wp_core_install_with_retries "$SITE_URL" "$SITE_TITLE" "$ADMIN_USER" "$ADMIN_PASS" "$ADMIN_EMAIL"; then
         INSTALL_WARN="WordPress core install step had issues after retries"
       fi
     fi
+
+    # Force English (skip language screen) + sane defaults
+    wp_run language core install "$LOCALE" >/dev/null 2>&1 || true
+    wp_run language core activate "$LOCALE" >/dev/null 2>&1 || true
+    wp_run option update blog_public 0 >/dev/null 2>&1 || true
+    wp_run rewrite structure "/%postname%/" >/dev/null 2>&1 || true
+    wp_run rewrite flush --hard >/dev/null 2>&1 || true
   fi
 
   # Version check + final status
-  WP_EFF_VER="$(wp core version 2>/dev/null | tail -n1)"
-  if [ -n "$WP_EFF_VER" ] || wp core is-installed >/dev/null 2>&1; then
+  WP_EFF_VER="$(wp_run core version 2>/dev/null | tail -n1)"
+  if [ -n "$WP_EFF_VER" ] || wp_run core is-installed >/dev/null 2>&1; then
     S_WP="ok"; INSTALL_WARN=""
   else
     [ -z "$INSTALL_WARN" ] && INSTALL_WARN="Prereqs for WordPress missing (php/db/wp-cli)"
@@ -416,6 +395,7 @@ if command -v "$wp_bin" >/dev/null 2>&1; then
   safe chown -R www-data:www-data "$WP_PATH"
   safe find "$WP_PATH" -type d -exec chmod 755 {} \;
   safe find "$WP_PATH" -type f -exec chmod 644 {} \;
+
 else
   S_WP="skipped"
   mark_warn "WP-CLI missing and could not be installed"
@@ -432,8 +412,8 @@ if [ -n "$DOMAIN" ] && [ -n "$LETSENCRYPT_EMAIL" ] && [ "$S_NGINX" = "ok" ]; the
     if certbot --nginx -d "$DOMAIN" -d "www.$DOMAIN" \
         --non-interactive --agree-tos -m "$LETSENCRYPT_EMAIL" --redirect >/tmp/.certbot_issue.log 2>&1; then
       S_SSL="issued"
-      "$wp_bin" option update home "https://$DOMAIN" >/dev/null 2>&1 || true
-      "$wp_bin" option update siteurl "https://$DOMAIN" >/dev/null 2>&1 || true
+      wp_run option update home "https://$DOMAIN" >/dev/null 2>&1 || true
+      wp_run option update siteurl "https://$DOMAIN" >/dev/null 2>&1 || true
     else
       S_SSL="failed"; mark_warn "Certbot issuance failed (see /tmp/.certbot_issue.log)"
     fi
@@ -441,8 +421,6 @@ if [ -n "$DOMAIN" ] && [ -n "$LETSENCRYPT_EMAIL" ] && [ "$S_NGINX" = "ok" ]; the
     S_SSL="skipped"; mark_warn "Certbot not installed (see /tmp/.certbot_install.log)"
   fi
 fi
-
-
 
 # -------------------- Report --------------------
 mkdir -p "$(dirname "$REPORT_PATH")" 2>/dev/null || true
@@ -475,16 +453,16 @@ mkdir -p "$(dirname "$REPORT_PATH")" 2>/dev/null || true
   echo '}'
 } > "$REPORT_PATH"
 
-# Perms
-  safe chown -R www-data:www-data "$WP_PATH"
-  safe find "$WP_PATH" -type d -exec chmod 755 {} \;
-  safe find "$WP_PATH" -type f -exec chmod 644 {} \;
+# Permissions again (just in case)
+safe chown -R www-data:www-data "$WP_PATH"
+safe find "$WP_PATH" -type d -exec chmod 755 {} \;
+safe find "$WP_PATH" -type f -exec chmod 644 {} \;
 
-  # Add symlink for site if not already linked
-  if [ -f "/etc/nginx/sites-available/${SITENAME}" ] && [ ! -f "/etc/nginx/sites-enabled/${SITENAME}" ]; then
-    log "Linking Nginx site configuration for ${SITENAME}…"
-    sudo ln -s "/etc/nginx/sites-available/${SITENAME}" "/etc/nginx/sites-enabled/${SITENAME}"
-  fi
+# Link site config if missing (idempotent)
+if [ -f "/etc/nginx/sites-available/${SITENAME}" ] && [ ! -f "/etc/nginx/sites-enabled/${SITENAME}" ]; then
+  log "Linking Nginx site configuration for ${SITENAME}…"
+  ln -s "/etc/nginx/sites-available/${SITENAME}" "/etc/nginx/sites-enabled/${SITENAME}" >/dev/null 2>&1 || true
+fi
 
 log "Report written to $REPORT_PATH"
 

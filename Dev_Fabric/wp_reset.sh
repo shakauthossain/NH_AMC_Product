@@ -21,6 +21,7 @@ REPORT_PATH="/tmp/droplet_reset_report.json"
 
 log(){ echo "[$(date -u +'%Y-%m-%dT%H:%M:%SZ')] $*"; }
 
+
 confirm(){
   if [[ "$FORCE" == "true" ]]; then return 0; fi
   read -r -p "$1 (y/N): " ans

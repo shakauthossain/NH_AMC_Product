@@ -1,4 +1,4 @@
-from fastapi import FastAPI, HTTPException, Header, Depends
+from fastapi import FastAPI, HTTPException, Header, Depends, Request
 from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from celery.result import AsyncResult
@@ -15,10 +15,10 @@ SITES: dict[str, dict] = {}
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=False,             # set True only if you need cookies
-    allow_methods=["*"],                 # or list specific: ["GET","POST","OPTIONS"]
-    allow_headers=["*"],                 # include "Authorization" etc.
+    allow_origins=settings.CORS_ALLOW_ORIGINS,
+    allow_credentials=False,
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
 
 def _extract_bearer(token_header: str | None) -> str | None:
@@ -138,10 +138,30 @@ def get_task(task_id: str):
     return JSONResponse(payload)
 
 @app.post("/tasks/wp-reset", response_model=TaskEnqueueResponse, summary="Hard reset the droplet to a clean state")
-def trigger_wp_reset(req: WPResetRequest, site: SiteConfig, _ok: bool = Depends(require_reset_token)):
+def trigger_wp_reset(
+    req: WPResetRequest,
+    site: SiteConfig,
+    _ok: bool = Depends(require_reset_token),
+    request: Request = None  # optional, lets us read raw body if needed
+):
+    # Log the parsed models
+    log.info(f"[wp-reset] Parsed req: {req.dict()}")
+    log.info(f"[wp-reset] Parsed site: {site.dict()}")
+
+    # If you also want raw JSON from frontend (before pydantic parsing)
+    if request is not None:
+        try:
+            raw_body = request.json()
+            log.info(f"[wp-reset] Raw incoming body: {raw_body}")
+        except Exception as e:
+            log.warning(f"[wp-reset] Could not read raw body: {e}")
+
+    # Enforce required values
+    if not site.host or not site.host.strip():
+        raise HTTPException(status_code=422, detail="site.host is required")
+
     site.user = "root"
     task = run_site_task.delay(
-        
         site.dict(),
         "wp_reset_sh",
         wp_path=req.wp_path,
@@ -152,4 +172,3 @@ def trigger_wp_reset(req: WPResetRequest, site: SiteConfig, _ok: bool = Depends(
         report_path=req.report_path
     )
     return {"task_id": task.id, "status": "queued"}
-
