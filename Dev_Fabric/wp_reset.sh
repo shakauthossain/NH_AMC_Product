@@ -1,183 +1,172 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# WordPress rollback (auto-detect) for Ubuntu + Nginx + MySQL + PHP
-# - Finds wp-config.php -> gets DB name/user and WP path
-# - Finds Nginx site serving that path
-# - Confirms each destructive step (use --force to skip prompts)
-# - Optional: purge stack (--purge-stack) and reset UFW (--reset-ufw)
+# droplet_reset_to_ssh_only.sh
+# Reset Ubuntu droplet to a minimal "SSH-only" state, removing common web stack bits.
+# Tested on Ubuntu 20.04/22.04/24.04.
 #
 # Usage:
-#   rollback_wp.sh [-p WP_PATH] [-d DOMAIN] [-r REPORT_PATH] [--force] [--purge-stack] [--reset-ufw]
+#   sudo bash droplet_reset_to_ssh_only.sh [--force] [--no-ufw] [--no-reboot]
 #
-# Examples:
-#   rollback_wp.sh --force
-#   rollback_wp.sh -p /var/www/html -d example.com --purge-stack --reset-ufw --force
+# Notes:
+# - Keeps your current SSH session alive; do NOT close it until done.
+# - UFW will be reset to allow only OpenSSH (unless --no-ufw).
+# - MySQL/MariaDB data under /var/lib/mysql will be deleted.
+# - Apache/Nginx/PHP configs & logs are removed.
 
-REPORT_PATH="/tmp/wp_rollback_report.json"
-WP_PATH=""
-DOMAIN=""
 FORCE="false"
-PURGE_STACK="false"
-RESET_UFW="false"
+DO_UFW="true"
+DO_REBOOT="true"
+REPORT_PATH="/tmp/droplet_reset_report.json"
 
-log() { echo "[$(date -u +'%Y-%m-%dT%H:%M:%SZ')] $*"; }
+log(){ echo "[$(date -u +'%Y-%m-%dT%H:%M:%SZ')] $*"; }
 
-confirm() {
-  local prompt="$1"
-  if [[ "$FORCE" == "true" ]]; then
-    return 0
-  fi
-  read -r -p "$prompt (y/N): " ans
+confirm(){
+  if [[ "$FORCE" == "true" ]]; then return 0; fi
+  read -r -p "$1 (y/N): " ans
   [[ "$ans" == "y" || "$ans" == "Y" ]]
+}
+
+require_root(){
+  if [[ $EUID -ne 0 ]]; then
+    echo "Please run as root (e.g. sudo)." >&2
+    exit 1
+  fi
 }
 
 # ---- args ----
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    -p|--path) WP_PATH="${2:?}"; shift 2;;
-    -d|--domain) DOMAIN="${2:?}"; shift 2;;
-    -r|--report) REPORT_PATH="${2:?}"; shift 2;;
     --force) FORCE="true"; shift;;
-    --purge-stack) PURGE_STACK="true"; shift;;
-    --reset-ufw) RESET_UFW="true"; shift;;
+    --no-ufw) DO_UFW="false"; shift;;
+    --no-reboot) DO_REBOOT="false"; shift;;
     -h|--help)
-      sed -n '1,60p' "$0"; exit 0;;
+      sed -n '1,120p' "$0"; exit 0;;
     *)
       echo "Unknown arg: $1"; exit 1;;
   esac
 done
 
-log "Starting WordPress rollback (auto-detect mode)"
+require_root
+log "Starting droplet reset to SSH-only state"
 
-# ---- detect wp-config / path ----
-if [[ -z "${WP_PATH}" ]]; then
-  log "Searching for wp-config.php under /var/www and /home ..."
-  # Prefer match by domain if supplied
-  if [[ -n "$DOMAIN" ]]; then
-    CANDIDATES=$(sudo grep -rl --exclude-dir=wp-content "DB_NAME" /var/www /home 2>/dev/null | grep "wp-config.php" || true)
-    # When DOMAIN given, try to find nginx site and check its root
-    if [[ -d /etc/nginx/sites-enabled ]]; then
-      SITE_FILE=$(grep -rl "$DOMAIN" /etc/nginx/sites-enabled 2>/dev/null | head -n1 || true)
-      if [[ -n "$SITE_FILE" ]]; then
-        ROOT_LINE=$(grep -E "^\s*root\s+" "$SITE_FILE" | head -n1 || true)
-        ROOT_DIR=$(echo "$ROOT_LINE" | awk '{print $2}' | sed 's/;//')
-        if [[ -n "$ROOT_DIR" && -f "$ROOT_DIR/wp-config.php" ]]; then
-          WP_PATH="$ROOT_DIR"
-        fi
-      fi
-    fi
-    # fallback to first candidate path
-    if [[ -z "$WP_PATH" && -n "$CANDIDATES" ]]; then
-      WP_PATH=$(dirname "$(echo "$CANDIDATES" | head -n1)")
-    fi
-  else
-    WP_PATH=$(dirname "$(sudo find /var/www /home -type f -name wp-config.php 2>/dev/null | head -n1 || true)")
-  fi
+# ---- quick sanity message ----
+log "This will PURGE Nginx/Apache, MySQL/MariaDB, PHP, Certbot and delete their data/configs."
+log "It will NOT remove your user accounts or SSH."
+
+if ! confirm "Proceed with destructive reset?"; then
+  echo "Aborted."
+  exit 0
 fi
 
-if [[ -z "${WP_PATH}" || ! -f "${WP_PATH}/wp-config.php" ]]; then
-  echo "Error: Could not locate wp-config.php. Provide --path or ensure WordPress exists."
-  exit 1
-fi
+export DEBIAN_FRONTEND=noninteractive
+apt-get update -y || true
 
-log "Detected WordPress path: $WP_PATH"
-WP_CONFIG="$WP_PATH/wp-config.php"
+# ---- stop services if present ----
+log "Stopping services (ignore errors if not installed)"
+systemctl stop nginx || true
+systemctl stop apache2 || true
+systemctl stop mysql || true
+systemctl stop mariadb || true
+# stop any php-fpm units
+mapfile -t PHP_FPM_UNITS < <(systemctl list-units --type=service --all | awk '/php.*-fpm\.service/ {print $1}')
+for u in "${PHP_FPM_UNITS[@]:-}"; do systemctl stop "$u" || true; done
+systemctl stop redis-server || true
+systemctl stop memcached || true
+systemctl stop varnish || true
 
-# ---- extract DB credentials from wp-config ----
-DB_NAME=$(grep -E "define\(\s*'DB_NAME'" "$WP_CONFIG" | sed "s/.*'DB_NAME'\s*,\s*'\([^']*\)'.*/\1/")
-DB_USER=$(grep -E "define\(\s*'DB_USER'" "$WP_CONFIG" | sed "s/.*'DB_USER'\s*,\s*'\([^']*\)'.*/\1/")
+# ---- disable services ----
+log "Disabling services"
+systemctl disable nginx apache2 mysql mariadb redis-server memcached varnish >/dev/null 2>&1 || true
+for u in "${PHP_FPM_UNITS[@]:-}"; do systemctl disable "$u" >/dev/null 2>&1 || true; done
 
-if [[ -z "$DB_NAME" || -z "$DB_USER" ]]; then
-  echo "Error: Failed to parse DB_NAME/DB_USER from $WP_CONFIG"
-  exit 1
-fi
-log "DB Name: $DB_NAME"
-log "DB User: $DB_USER"
+# ---- purge packages ----
+log "Purging packages (may take a bit)"
+apt-get purge -y \
+  nginx nginx-common nginx-core \
+  apache2 apache2-bin apache2-data apache2-utils \
+  mysql-server mysql-client mysql-common mariadb-server mariadb-client mariadb-common \
+  "php*" \
+  certbot python3-certbot* \
+  redis-server memcached varnish || true
 
-# ---- detect nginx site file ----
-NGINX_SITE_FILE=""
-if [[ -d /etc/nginx/sites-enabled ]]; then
-  # Try by root path first
-  NGINX_SITE_FILE=$(grep -rl "$WP_PATH" /etc/nginx/sites-enabled 2>/dev/null | head -n1 || true)
-  # Try by domain if not found
-  if [[ -z "$NGINX_SITE_FILE" && -n "$DOMAIN" ]]; then
-    NGINX_SITE_FILE=$(grep -rl "$DOMAIN" /etc/nginx/sites-enabled 2>/dev/null | head -n1 || true)
-  fi
-fi
-NGINX_SITE_NAME=""
-if [[ -n "$NGINX_SITE_FILE" ]]; then
-  NGINX_SITE_NAME=$(basename "$NGINX_SITE_FILE")
-  log "Detected Nginx site: $NGINX_SITE_NAME"
+apt-get autoremove -y || true
+apt-get autoclean -y || true
+
+# ---- remove residual config/data/logs ----
+log "Removing residual directories"
+rm -rf \
+  /etc/nginx /var/log/nginx /var/cache/nginx \
+  /etc/apache2 /var/log/apache2 \
+  /etc/mysql /var/lib/mysql /var/log/mysql \
+  /etc/php /var/lib/php /var/log/php* \
+  /etc/letsencrypt /var/log/letsencrypt \
+  /var/www \
+  /etc/redis /var/lib/redis /var/log/redis \
+  /etc/memcached.conf /var/log/memcached \
+  /etc/varnish /var/lib/varnish /var/log/varnish || true
+
+# ---- make sure OpenSSH is good to go ----
+log "Ensuring OpenSSH Server is installed and enabled"
+apt-get install -y --no-install-recommends openssh-server
+systemctl enable --now ssh >/dev/null 2>&1 || systemctl enable --now sshd >/dev/null 2>&1 || true
+
+# ---- firewall reset (UFW) ----
+UFW_STATUS="skipped"
+if [[ "$DO_UFW" == "true" ]] && command -v ufw >/dev/null 2>&1; then
+  log "Resetting UFW and allowing SSH only"
+  # Reset first, then allow SSH before enabling
+  ufw --force reset || true
+  ufw default deny incoming || true
+  ufw default allow outgoing || true
+  ufw allow OpenSSH || ufw allow 22 || true
+  ufw --force enable || true
+  UFW_STATUS="reset"
 else
-  log "No Nginx site linked found (skipping site removal step unless you choose purge stack)."
-fi
-
-# ---- stop services (optional) ----
-if confirm "Stop Nginx, MySQL, and PHP-FPM services now?"; then
-  systemctl stop nginx mysql || true
-  systemctl stop "$(systemctl list-units --type=service | awk '/php.*-fpm\.service/ {print $1}')" || true
-  log "Services stopped."
-fi
-
-# ---- remove WordPress files ----
-if confirm "Remove WordPress files at '$WP_PATH'?"; then
-  rm -rf "$WP_PATH"
-  log "WordPress files removed."
-fi
-
-# ---- drop DB and user (socket auth; no root pw) ----
-if confirm "Drop MySQL database '$DB_NAME' and user '$DB_USER'@'localhost'?"; then
-  mysql -e "DROP DATABASE IF EXISTS \`$DB_NAME\`;"
-  mysql -e "DROP USER IF EXISTS '$DB_USER'@'localhost'; FLUSH PRIVILEGES;"
-  log "Database and user removed."
-fi
-
-# ---- remove nginx site ----
-if [[ -n "$NGINX_SITE_NAME" ]]; then
-  if confirm "Remove Nginx site config '$NGINX_SITE_NAME' (from sites-available & sites-enabled) and reload Nginx?"; then
-    rm -f "/etc/nginx/sites-enabled/$NGINX_SITE_NAME" || true
-    rm -f "/etc/nginx/sites-available/$NGINX_SITE_NAME" || true
-    if nginx -t; then systemctl reload nginx; fi
-    log "Nginx site removed and Nginx reloaded."
+  if [[ "$DO_UFW" == "true" ]]; then
+    log "UFW not installed; skipping firewall step."
+  else
+    log "UFW step disabled by --no-ufw."
   fi
 fi
 
-# ---- optional: purge stack ----
-if [[ "$PURGE_STACK" == "true" ]]; then
-  if confirm "Purge Nginx, MySQL, PHP* packages and remove configs (/etc/nginx,/etc/mysql,/etc/php)?"; then
-    apt-get purge -y nginx nginx-common nginx-core mysql-server mysql-common "php*" ufw unzip wget curl || true
-    apt-get autoremove -y || true
-    apt-get autoclean -y || true
-    systemctl disable nginx mysql >/dev/null 2>&1 || true
-    # Remove leftover configs
-    rm -rf /etc/nginx /etc/mysql /etc/php || true
-    log "LEMP stack purged."
-  fi
-fi
+# ---- final apt clean ----
+apt-get autoremove -y || true
+apt-get autoclean -y || true
 
-# ---- optional: reset UFW ----
-if [[ "$RESET_UFW" == "true" ]]; then
-  if command -v ufw >/dev/null 2>&1; then
-    if confirm "Reset UFW firewall rules?"; then
-      ufw --force reset || true
-      log "UFW reset."
-    fi
-  fi
-fi
-
-# ---- write report ----
+# ---- report ----
 cat > "$REPORT_PATH" <<JSON
 {
-  "status": "rolled_back",
-  "wp_path": "$WP_PATH",
-  "db_name": "$DB_NAME",
-  "db_user": "$DB_USER",
-  "nginx_site": "$NGINX_SITE_NAME",
-  "purged_stack": "$PURGE_STACK",
-  "reset_ufw": "$RESET_UFW",
-  "forced": "$FORCE"
+  "status": "ssh_only",
+  "timestamp_utc": "$(date -u +'%Y-%m-%dT%H:%M:%SZ')",
+  "purged": [
+    "nginx","apache2","mysql/mariadb","php","certbot","redis","memcached","varnish"
+  ],
+  "removed_paths": [
+    "/etc/nginx","/var/log/nginx","/etc/apache2","/var/log/apache2",
+    "/etc/mysql","/var/lib/mysql","/var/log/mysql",
+    "/etc/php","/var/lib/php","/var/log/php*",
+    "/etc/letsencrypt","/var/log/letsencrypt",
+    "/var/www",
+    "/etc/redis","/var/lib/redis","/var/log/redis",
+    "/etc/memcached.conf","/var/log/memcached",
+    "/etc/varnish","/var/lib/varnish","/var/log/varnish"
+  ],
+  "ufw": "$UFW_STATUS",
+  "ssh_active": "$(systemctl is-active ssh 2>/dev/null || systemctl is-active sshd 2>/dev/null || echo unknown)"
 }
 JSON
 
-echo "$REPORT_PATH"
+log "Done. Report: $REPORT_PATH"
+
+# ---- optional reboot ----
+if [[ "$DO_REBOOT" == "true" ]]; then
+  if confirm "Reboot now to complete cleanup?"; then
+    log "Rebooting..."
+    reboot
+  else
+    log "Skipping reboot (you chose no)."
+  fi
+else
+  log "Reboot suppressed by --no-reboot."
+fi

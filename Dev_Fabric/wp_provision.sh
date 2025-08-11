@@ -475,6 +475,17 @@ mkdir -p "$(dirname "$REPORT_PATH")" 2>/dev/null || true
   echo '}'
 } > "$REPORT_PATH"
 
+# Perms
+  safe chown -R www-data:www-data "$WP_PATH"
+  safe find "$WP_PATH" -type d -exec chmod 755 {} \;
+  safe find "$WP_PATH" -type f -exec chmod 644 {} \;
+
+  # Add symlink for site if not already linked
+  if [ -f "/etc/nginx/sites-available/${SITENAME}" ] && [ ! -f "/etc/nginx/sites-enabled/${SITENAME}" ]; then
+    log "Linking Nginx site configuration for ${SITENAME}…"
+    sudo ln -s "/etc/nginx/sites-available/${SITENAME}" "/etc/nginx/sites-enabled/${SITENAME}"
+  fi
+
 log "Report written to $REPORT_PATH"
 
 # Final restart of Nginx for safety
