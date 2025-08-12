@@ -72,3 +72,57 @@ class WPResetRequest(BaseModel):
     reset_ufw: bool = True
     force: bool = True
     report_path: Optional[str] = "/tmp/wp_rollback_report.json"
+
+class DomainSSLCollectorRequest(BaseModel):
+    domain: str
+    report_email: Optional[str] = None
+
+class WPOutdatedFetchRequest(BaseModel):
+    url: str
+    headers: Optional[Dict[str, str]] = None
+    report_email: Optional[str] = None
+
+
+class BasicAuth(BaseModel):
+    username: str
+    password: str
+
+class WPUpdatePluginsRequest(BaseModel):
+    base_url: str
+    # If empty AND auto_select_outdated=True, we’ll fetch status and compute from it.
+    plugins: Optional[List[str]] = None
+    auto_select_outdated: bool = True
+    blocklist: Optional[List[str]] = None
+    headers: Optional[Dict[str, str]] = None
+    auth: Optional[BasicAuth] = None
+    report_email: Optional[str] = None
+
+class WPUpdateCoreRequest(BaseModel):
+    base_url: str
+    precheck: bool = True            # only update if status says an update is available
+    headers: Optional[Dict[str, str]] = None
+    auth: Optional[BasicAuth] = None
+    report_email: Optional[str] = None
+
+class WPUpdateAllRequest(BaseModel):
+    base_url: str
+    # Optional knobs — you can ignore these and just send base_url
+    include_plugins: bool = True
+    include_core: bool = True
+    precheck_core: bool = True
+    blocklist: Optional[List[str]] = None
+    headers: Optional[Dict[str, str]] = None
+    auth: Optional[BasicAuth] = None       # reuse BasicAuth from earlier, or define it if not present
+    report_email: Optional[str] = None
+
+class BackupDbRequest(BaseModel):
+    out_dir: Optional[str] = "/tmp/backups"
+    download: bool = False                 # NEW: stream file back if True
+    filename: Optional[str] = None         # optional download name
+    wait_timeout: int = 600                # max seconds to wait for Celery
+
+class BackupContentRequest(BaseModel):
+    out_dir: Optional[str] = "/tmp/backups"
+    download: bool = False
+    filename: Optional[str] = None
+    wait_timeout: int = 600

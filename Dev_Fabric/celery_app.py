@@ -3,6 +3,7 @@ from config import settings
 from task_runner import run_fabric_task
 from emailer import send_report_email
 from logger import get_logger
+from datetime import datetime, timezone
 
 celery = Celery(__name__, broker=str(settings.BROKER_URL), backend=str(settings.RESULT_BACKEND))
 log = get_logger("worker")
@@ -21,4 +22,242 @@ def run_site_task(self, site_config: dict, task_name: str, report_email: str | N
             result = {"_original": result, "_email_error": str(e)}
     return result
 
-#PYTHONPATH=. celery -A celery_app worker -l info
+@celery.task(bind=True, name="domain_ssl_checker.collect")
+def domain_ssl_collect_task(self, domain: str, report_email: str | None = None):
+    log.info(f"[task {self.request.id}] domain_ssl_collect domain={domain}")
+    try:
+        from modules.domain_ssl_checker import get_domain_expiry, get_ssl_expiry
+    except Exception as e:
+        return {"domain": domain, "ok": False, "error": f"Import error: {e}"}
+
+    def _aware(dt):
+        if dt is None: return None
+        return dt.replace(tzinfo=timezone.utc) if dt.tzinfo is None else dt.astimezone(timezone.utc)
+    def _iso(dt): return _aware(dt).isoformat() if dt else None
+    def _days(dt):
+        dt = _aware(dt)
+        return (dt - datetime.now(timezone.utc)).days if dt else None
+
+    # WHOIS -> your function returns string or "WHOIS error: …"
+    whois_raw = get_domain_expiry(domain)
+    whois = {"ok": False}
+    try:
+        if isinstance(whois_raw, str) and not whois_raw.startswith("WHOIS error:"):
+            dt = datetime.strptime(whois_raw, "%Y-%m-%d %H:%M:%S")
+            whois = {"ok": True, "expiration_readable": whois_raw, "expiration": _iso(dt), "days_left": _days(dt)}
+        else:
+            whois = {"ok": False, "error": whois_raw}
+    except Exception as e:
+        whois = {"ok": False, "error": f"WHOIS parse error: {e}"}
+
+    # SSL -> your function returns datetime or "SSL error: …"
+    ssl_raw = get_ssl_expiry(domain)
+    sslb = {"ok": False}
+    try:
+        if hasattr(ssl_raw, "strftime"):
+            dt = _aware(ssl_raw)
+            sslb = {"ok": True, "not_after_readable": dt.strftime("%Y-%m-%d %H:%M:%S"),
+                    "not_after": _iso(dt), "days_left": _days(dt)}
+        else:
+            sslb = {"ok": False, "error": ssl_raw}
+    except Exception as e:
+        sslb = {"ok": False, "error": f"SSL parse error: {e}"}
+
+    result = {"domain": domain.lower(), "whois": whois, "ssl": sslb,
+              "ok": bool(whois.get("ok") and sslb.get("ok")),
+              "checked_at": datetime.now(timezone.utc).isoformat()}
+
+    if report_email:
+        try:
+            send_report_email(report_email, f"[{settings.APP_NAME}] Domain/SSL check for {domain}", result or {})
+        except Exception as e:
+            result = {"_original": result, "_email_error": str(e)}
+    return result
+
+@celery.task(bind=True, name="wp.outdated.fetch")
+def wp_outdated_fetch_task(self, url: str, headers: dict | None = None, report_email: str | None = None):
+    log.info(f"[task {self.request.id}] wp_outdated_fetch url={url}")
+    try:
+        from modules.outdated_fetcher import fetch_outdated
+        result = fetch_outdated(url, headers)
+    except Exception as e:
+        result = {"ok": False, "url": url, "error": str(e)}
+
+    if report_email:
+        try:
+            send_report_email(report_email, f"[{settings.APP_NAME}] WP outdated status for {url}", result or {})
+        except Exception as e:
+            result = {"_original": result, "_email_error": str(e)}
+
+    return result
+
+@celery.task(bind=True, name="wp.update.plugins")
+def wp_update_plugins_task(self,
+                           base_url: str,
+                           plugins: list[str] | None = None,
+                           auto_select_outdated: bool = True,
+                           blocklist: list[str] | None = None,
+                           auth: dict | None = None,
+                           headers: dict | None = None,
+                           report_email: str | None = None):
+    # avoid logging secrets
+    safe_hdrs = {k: ("***" if k.lower() == "authorization" else v) for k, v in (headers or {}).items()}
+    log.info(f"[task {self.request.id}] wp_update_plugins url={base_url} plugins={plugins} auto={auto_select_outdated} headers={bool(headers)} auth={bool(auth)}")
+
+    try:
+        from modules.wp_updater import fetch_status, select_outdated_plugins, update_plugins
+    except Exception as e:
+        return {"ok": False, "error": f"Import error: {e}"}
+
+    auth_tuple = (auth["username"], auth["password"]) if auth else None
+
+    selected = list(plugins or [])
+    status = None
+    if auto_select_outdated and not selected:
+        try:
+            status = fetch_status(base_url, auth_tuple, headers)
+            selected = select_outdated_plugins(status, blocklist)
+        except Exception as e:
+            return {"ok": False, "error": f"Status fetch failed: {e}", "url": base_url}
+
+    if not selected:
+        result = {"ok": True, "updated": [], "message": "No plugins selected/outdated"}
+    else:
+        result = update_plugins(base_url, selected, auth_tuple, headers)
+        result["selected"] = selected
+        result["blocklist"] = blocklist or []
+
+    if status is not None:
+        result["status_snapshot"] = status
+
+    if report_email:
+        try:
+            send_report_email(report_email, f"[{settings.APP_NAME}] WP plugin updates for {base_url}", result or {})
+        except Exception as e:
+            result = {"_original": result, "_email_error": str(e)}
+    return result
+
+
+@celery.task(bind=True, name="wp.update.core")
+def wp_update_core_task(self,
+                        base_url: str,
+                        precheck: bool = True,
+                        auth: dict | None = None,
+                        headers: dict | None = None,
+                        report_email: str | None = None):
+    log.info(f"[task {self.request.id}] wp_update_core url={base_url} precheck={precheck} headers={bool(headers)} auth={bool(auth)}")
+
+    try:
+        from modules.wp_updater import fetch_status, update_core
+    except Exception as e:
+        return {"ok": False, "error": f"Import error: {e}"}
+
+    auth_tuple = (auth["username"], auth["password"]) if auth else None
+
+    status = None
+    if precheck:
+        try:
+            status = fetch_status(base_url, auth_tuple, headers)
+            core = (status.get("core") or {})
+            if not core.get("update_available"):
+                res = {
+                    "ok": True,
+                    "skipped": True,
+                    "reason": "core is already up-to-date",
+                    "current": core.get("current_version"),
+                    "latest": core.get("latest_version"),
+                    "status_snapshot": status,
+                }
+                if report_email:
+                    try:
+                        send_report_email(report_email, f"[{settings.APP_NAME}] WP core update skipped ({base_url})", res or {})
+                    except Exception as e:
+                        res = {"_original": res, "_email_error": str(e)}
+                return res
+        except Exception as e:
+            return {"ok": False, "error": f"Status fetch failed: {e}", "url": base_url}
+
+    result = update_core(base_url, auth_tuple, headers)
+    if status is not None:
+        result["status_snapshot"] = status
+
+    if report_email:
+        try:
+            send_report_email(report_email, f"[{settings.APP_NAME}] WP core update for {base_url}", result or {})
+        except Exception as e:
+            result = {"_original": result, "_email_error": str(e)}
+    return result
+
+@celery.task(bind=True, name="wp.update.all")
+def wp_update_all_task(
+    self,
+    base_url: str,
+    auth: dict | None = None,           # optional Basic auth: {"username": "...", "password": "..."}
+    headers: dict | None = None,        # optional headers (e.g., Bearer token)
+    blocklist: list[str] | None = None, # optional plugin_file list to skip
+    include_plugins: bool = True,
+    include_core: bool = True,
+    precheck_core: bool = True,         # skip core if already up to date
+    report_email: str | None = None,
+):
+    log.info(f"[task {self.request.id}] wp_update_all url={base_url} include_plugins={include_plugins} include_core={include_core}")
+    try:
+        from modules.wp_updater import fetch_status, select_outdated_plugins, update_plugins, update_core
+    except Exception as e:
+        return {"ok": False, "url": base_url, "error": f"Import error: {e}"}
+
+    auth_tuple = (auth["username"], auth["password"]) if auth else None
+    result = {
+        "ok": False,
+        "url": base_url,
+        "plugins": {"selected": [], "skipped": False, "result": None},
+        "core": {"skipped": False, "result": None},
+        "ran_at": datetime.now(timezone.utc).isoformat(),
+    }
+
+    # 1) fetch status once
+    try:
+        status = fetch_status(base_url, auth_tuple, headers)
+    except Exception as e:
+        return {"ok": False, "url": base_url, "error": f"Status fetch failed: {e}"}
+    result["status_snapshot"] = status
+
+    # 2) plugins
+    plugins_ok = True
+    if include_plugins:
+        selected = select_outdated_plugins(status, blocklist)
+        result["plugins"]["selected"] = selected
+        if selected:
+            upd = update_plugins(base_url, selected, auth_tuple, headers)
+            result["plugins"]["result"] = upd
+            plugins_ok = bool(upd.get("ok"))
+        else:
+            result["plugins"]["skipped"] = True
+
+    # 3) core
+    core_ok = True
+    if include_core:
+        core = status.get("core") or {}
+        if precheck_core and not core.get("update_available"):
+            result["core"].update({
+                "skipped": True,
+                "reason": "core already up to date",
+                "current": core.get("current_version"),
+                "latest": core.get("latest_version"),
+            })
+        else:
+            upd = update_core(base_url, auth_tuple, headers)
+            result["core"]["result"] = upd
+            core_ok = bool(upd.get("ok"))
+
+    result["ok"] = bool(plugins_ok and core_ok)
+
+    if report_email:
+        try:
+            send_report_email(report_email, f"[{settings.APP_NAME}] WP all-updates for {base_url}", result or {})
+        except Exception as e:
+            result = {"_original": result, "_email_error": str(e)}
+    return result
+
+# PYTHONPATH=. celery -A celery_app worker -l info
+# PYTHONPATH=. celery -A celery_app worker -l info --pool=solo

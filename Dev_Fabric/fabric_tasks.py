@@ -39,6 +39,23 @@ def backup_site(c, wp_path, db_name, db_user, db_pass, out_dir="/tmp/backups"):
     return {"db_dump": sql, "content_tar": tar, "timestamp": ts}
 
 @task
+def backup_db(c, db_name, db_user, db_pass, out_dir="/tmp/backups"):
+    ts = datetime.datetime.utcnow().strftime("%Y%m%d%H%M%S")
+    sql = f"{out_dir}/{db_name}-{ts}.sql.gz"
+    c.run(f"mkdir -p {out_dir}")
+    with c.prefix(f"export MYSQL_PWD='{db_pass}'"):
+        c.run(f"mysqldump -u {db_user} {db_name} | gzip > {sql}")
+    return {"db_dump": sql, "timestamp": ts}
+
+@task
+def backup_wp_content(c, wp_path, out_dir="/tmp/backups"):
+    ts = datetime.datetime.utcnow().strftime("%Y%m%d%H%M%S")
+    tar = f"{out_dir}/wp-content-{ts}.tar.gz"
+    c.run(f"mkdir -p {out_dir}")
+    c.run(f"tar -C {wp_path} -czf {tar} wp-content")
+    return {"content_tar": tar, "timestamp": ts}
+
+@task
 def healthcheck(c, url, keyword=None, screenshot=False, out_path="/tmp/site.png"):
     # basic HTTP probe
     r = c.local(f"curl -s -w '%{{http_code}}' -o /tmp/_hc_body {url}", hide=True, warn=True)

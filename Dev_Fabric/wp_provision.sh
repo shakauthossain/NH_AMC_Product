@@ -125,7 +125,7 @@ wp_bin="/usr/local/bin/wp"
 wp(){ su -s /bin/bash - www-data -c "cd '$WP_PATH' && $wp_bin $*"; }
 
 # New: always pass explicit --path and run as www-data
-wp_run(){ su -s /bin/bash - www-data -c "$wp_bin --path='$WP_PATH' $*"; }
+wp_run(){ su -s /bin/bash - www-data -c "$wp_bin --allow-root --path='$WP_PATH' $*"; }
 
 ensure_wpcli(){
   if command -v "$wp_bin" >/dev/null 2>&1; then return 0; fi
@@ -346,12 +346,12 @@ fi
 INSTALL_WARN=""
 
 if command -v "$wp_bin" >/dev/null 2>&1; then
-  # (a) Download core if missing
+  # (a) Download core if missing — pinned to $LOCALE
   if [ ! -f "$WP_PATH/wp-load.php" ]; then
     if [ "$WP_VERSION" = "latest" ]; then
-      wp_run core download >/tmp/.wp_core_download.log 2>&1 || mark_warn "WP core download failed"
+      wp_run core download --locale="$LOCALE" >/tmp/.wp_core_download.log 2>&1 || mark_warn "WP core download failed"
     else
-      wp_run core download --version="$WP_VERSION" >/tmp/.wp_core_download.log 2>&1 || mark_warn "WP core download ($WP_VERSION) failed"
+      wp_run core download --version="$WP_VERSION" --locale="$LOCALE" >/tmp/.wp_core_download.log 2>&1 || mark_warn "WP core download ($WP_VERSION) failed"
     fi
   fi
 
@@ -380,6 +380,40 @@ if command -v "$wp_bin" >/dev/null 2>&1; then
     wp_run option update blog_public 0 >/dev/null 2>&1 || true
     wp_run rewrite structure "/%postname%/" >/dev/null 2>&1 || true
     wp_run rewrite flush --hard >/dev/null 2>&1 || true
+
+    # --- Info page (idempotent) ---
+    INFO_PAGE_TITLE="Info"
+    INFO_PAGE_SLUG="info"
+    MAKE_INFO_HOMEPAGE="${MAKE_INFO_HOMEPAGE:-false}"  # export MAKE_INFO_HOMEPAGE=true to set as homepage
+
+    # Build content without heredocs (avoids EOF issues)
+    INFO_PAGE_CONTENT="$(printf '%b' "<h2>About this site</h2>\n<p><strong>Site:</strong> ${SITE_TITLE}</p>\n<p><strong>Admin contact:</strong> ${ADMIN_EMAIL}</p>\n")"
+
+    # Find or create the page
+    PAGE_ID="$(wp_run post list --post_type=page --pagename="$INFO_PAGE_SLUG" --field=ID 2>/dev/null | tail -n1)"
+    if [ -z "$PAGE_ID" ]; then
+      PAGE_ID="$(wp_run post create \
+        --post_type=page \
+        --post_status=publish \
+        --post_title="$INFO_PAGE_TITLE" \
+        --post_name="$INFO_PAGE_SLUG" \
+        --post_content="$INFO_PAGE_CONTENT" \
+        --porcelain 2>/dev/null | tail -n1)"
+    else
+      wp_run post update "$PAGE_ID" \
+        --post_title="$INFO_PAGE_TITLE" \
+        --post_content="$INFO_PAGE_CONTENT" >/dev/null 2>&1 || true
+    fi
+
+    # Optionally make it the homepage (fixed /dev/null)
+    if [ "${MAKE_INFO_HOMEPAGE,,}" = "true" ] && [ -n "$PAGE_ID" ]; then
+      wp_run option update show_on_front page >/dev/null 2>&1 || true
+      wp_run option update page_on_front "$PAGE_ID" >/dev/null 2>&1 || true
+    fi
+
+    # Ensure the site title & admin email reflect inputs (post-install idempotent)
+    wp_run option update blogname "$SITE_TITLE" >/dev/null 2>&1 || true
+    wp_run option update admin_email "$ADMIN_EMAIL" >/dev/null 2>&1 || true
   fi
 
   # Version check + final status

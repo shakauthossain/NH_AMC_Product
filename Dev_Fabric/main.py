@@ -1,14 +1,26 @@
-from fastapi import FastAPI, HTTPException, Header, Depends, Request
-from fastapi.responses import JSONResponse
+from fastapi import FastAPI, HTTPException, Header, Depends, Request, BackgroundTasks
+from fastapi.responses import JSONResponse, FileResponse
 from fastapi.middleware.cors import CORSMiddleware
 from celery.result import AsyncResult
-from celery_app import run_site_task, celery
-from schemas import SiteConfig, SSLCheckRequest, HealthcheckRequest, TaskEnqueueResponse, TaskResultResponse, WPInstallRequest, SiteConnection, SiteIdResponse, WPInstallRequest, TaskEnqueueResponse, TaskResultResponse, WPResetRequest
+from celery_app import (
+    run_site_task, celery, domain_ssl_collect_task, 
+    wp_outdated_fetch_task, wp_update_plugins_task, 
+    wp_update_core_task, wp_update_all_task)
+from schemas import (
+    DomainSSLCollectorRequest, SiteConfig, SSLCheckRequest, 
+    HealthcheckRequest, TaskEnqueueResponse, TaskResultResponse, 
+    WPInstallRequest, SiteConnection, SiteIdResponse, WPInstallRequest, 
+    TaskEnqueueResponse, TaskResultResponse, WPResetRequest, WPOutdatedFetchRequest,
+    WPUpdatePluginsRequest, WPUpdateCoreRequest, WPUpdateAllRequest,
+    BackupDbRequest, BackupContentRequest)
 from logger import get_logger
-from task_runner import verify_ssh
+from task_runner import verify_ssh, _conn_params, _normalize_site, _materialize_key
 from config import settings
 import uuid
-
+import os, tempfile, shutil
+from celery.result import AsyncResult
+from fabric import Connection
+    
 app = FastAPI(title="NH AMC MVP")
 log = get_logger("api")
 SITES: dict[str, dict] = {}
@@ -172,3 +184,138 @@ def trigger_wp_reset(
         report_path=req.report_path
     )
     return {"task_id": task.id, "status": "queued"}
+
+@app.post("/tasks/domain-ssl-collect", response_model=TaskEnqueueResponse, summary="Check domain WHOIS + SSL (local task)")
+def trigger_domain_ssl_collect(req: DomainSSLCollectorRequest):
+    task = domain_ssl_collect_task.delay(domain=req.domain, report_email=req.report_email)
+    return {"task_id": task.id, "status": "queued"}
+
+@app.post("/tasks/wp-outdated-fetch", response_model=TaskEnqueueResponse, summary="Fetch plugin/theme/core outdated status via WP REST")
+def trigger_wp_outdated_fetch(req: WPOutdatedFetchRequest):
+    task = wp_outdated_fetch_task.delay(url=req.url, headers=req.headers, report_email=req.report_email)
+    return {"task_id": task.id, "status": "queued"}
+
+@app.post("/tasks/wp-update/plugins", response_model=TaskEnqueueResponse, summary="Update WP plugins via REST")
+def trigger_wp_update_plugins(req: WPUpdatePluginsRequest):
+    task = wp_update_plugins_task.delay(
+        base_url=req.base_url,
+        plugins=req.plugins,
+        auto_select_outdated=req.auto_select_outdated,
+        blocklist=req.blocklist,
+        auth=(req.auth.dict() if req.auth else None),
+        headers=req.headers,
+        report_email=req.report_email
+    )
+    return {"task_id": task.id, "status": "queued"}
+
+@app.post("/tasks/wp-update/core", response_model=TaskEnqueueResponse, summary="Update WP core via REST")
+def trigger_wp_update_core(req: WPUpdateCoreRequest):
+    task = wp_update_core_task.delay(
+        base_url=req.base_url,
+        precheck=req.precheck,
+        auth=(req.auth.dict() if req.auth else None),
+        headers=req.headers,
+        report_email=req.report_email
+    )
+    return {"task_id": task.id, "status": "queued"}
+
+@app.post("/tasks/wp-update/all", response_model=TaskEnqueueResponse, summary="Update plugins + core in one click")
+def trigger_wp_update_all(req: WPUpdateAllRequest):
+    task = wp_update_all_task.delay(
+        base_url=req.base_url,
+        include_plugins=req.include_plugins,
+        include_core=req.include_core,
+        precheck_core=req.precheck_core,
+        blocklist=req.blocklist,
+        headers=req.headers,
+        auth=(req.auth.dict() if req.auth else None),
+        report_email=req.report_email,
+    )
+    return {"task_id": task.id, "status": "queued"}
+
+@app.post("/tasks/backup/db")   # remove response_model so we can return FileResponse
+def trigger_backup_db(req: BackupDbRequest, site: SiteConfig, background_tasks: BackgroundTasks):
+    site.user = "root"
+    task = run_site_task.delay(
+        site.dict(), "backup_db",
+        db_name=site.db_name, db_user=site.db_user, db_pass=site.db_pass,
+        out_dir=req.out_dir
+    )
+
+    # Normal async behavior (old style)
+    if not req.download:
+        return {"task_id": task.id, "status": "queued"}
+
+    # One-click: wait for task, then download the file
+    res = AsyncResult(task.id, app=celery)
+    try:
+        result = res.get(timeout=req.wait_timeout)
+    except Exception as e:
+        return JSONResponse({"task_id": task.id, "state": res.state, "error": f"timeout/wait failed: {e}"}, status_code=504)
+
+    remote_path = (result or {}).get("db_dump")
+    if not remote_path:
+        return JSONResponse({"task_id": task.id, "state": res.state, "error": "no db_dump path returned", "result": result}, status_code=500)
+
+    # Download over SSH to a temp file and stream it
+    site_dict = _normalize_site(site.dict())
+    key_created = bool(site_dict.get("private_key_pem"))
+    key_path = _materialize_key(site_dict)
+    params = _conn_params(site_dict)
+
+    tmpdir = tempfile.mkdtemp(prefix="dl_")
+    download_name = req.filename or os.path.basename(remote_path) or "database.sql.gz"
+    local_path = os.path.join(tmpdir, download_name)
+
+    try:
+        with Connection(**params) as c:
+            c.get(remote_path, local=local_path)
+    finally:
+        if key_created and key_path:
+            try: os.remove(key_path)
+            except Exception: pass
+
+    background_tasks.add_task(shutil.rmtree, tmpdir, ignore_errors=True)
+    return FileResponse(local_path, media_type="application/gzip", filename=download_name)
+
+
+@app.post("/tasks/backup/content")  # remove response_model so we can return FileResponse
+def trigger_backup_content(req: BackupContentRequest, site: SiteConfig, background_tasks: BackgroundTasks):
+    site.user = "root"
+    task = run_site_task.delay(
+        site.dict(), "backup_wp_content",
+        wp_path=site.wp_path, out_dir=req.out_dir
+    )
+
+    if not req.download:
+        return {"task_id": task.id, "status": "queued"}
+
+    res = AsyncResult(task.id, app=celery)
+    try:
+        result = res.get(timeout=req.wait_timeout)
+    except Exception as e:
+        return JSONResponse({"task_id": task.id, "state": res.state, "error": f"timeout/wait failed: {e}"}, status_code=504)
+
+    remote_path = (result or {}).get("content_tar")
+    if not remote_path:
+        return JSONResponse({"task_id": task.id, "state": res.state, "error": "no content_tar path returned", "result": result}, status_code=500)
+
+    site_dict = _normalize_site(site.dict())
+    key_created = bool(site_dict.get("private_key_pem"))
+    key_path = _materialize_key(site_dict)
+    params = _conn_params(site_dict)
+
+    tmpdir = tempfile.mkdtemp(prefix="dl_")
+    download_name = req.filename or os.path.basename(remote_path) or "wp-content.tar.gz"
+    local_path = os.path.join(tmpdir, download_name)
+
+    try:
+        with Connection(**params) as c:
+            c.get(remote_path, local=local_path)
+    finally:
+        if key_created and key_path:
+            try: os.remove(key_path)
+            except Exception: pass
+
+    background_tasks.add_task(shutil.rmtree, tmpdir, ignore_errors=True)
+    return FileResponse(local_path, media_type="application/gzip", filename=download_name)

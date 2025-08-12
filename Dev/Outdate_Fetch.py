@@ -1,6 +1,6 @@
 import requests
 
-URL = "http://localhost/TestWP2/wp-json/site/v1/status"
+URL = "http://139.59.102.1/wp-json/site/v1/status"
 
 def get_outdated_wp():
     try:
@@ -34,6 +34,5 @@ def get_outdated_wp():
 
     except Exception as e:
         print("Error:", e)
-
 
 get_outdated_wp()
