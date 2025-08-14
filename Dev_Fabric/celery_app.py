@@ -79,15 +79,9 @@ def wp_outdated_fetch_task(self, url: str, headers: dict | None = None, report_e
     log.info(f"[task {self.request.id}] wp_outdated_fetch url={url}")
     try:
         from modules.outdated_fetcher import fetch_outdated
-        result = fetch_outdated(url, headers)
+        result = fetch_outdated(url, headers)  # now auto-appends route + content-aware
     except Exception as e:
         result = {"ok": False, "url": url, "error": str(e)}
-
-    if report_email:
-        try:
-            send_report_email(report_email, f"[{settings.APP_NAME}] WP outdated status for {url}", result or {})
-        except Exception as e:
-            result = {"_original": result, "_email_error": str(e)}
 
     return result
 
@@ -100,8 +94,6 @@ def wp_update_plugins_task(self,
                            auth: dict | None = None,
                            headers: dict | None = None,
                            report_email: str | None = None):
-    # avoid logging secrets
-    safe_hdrs = {k: ("***" if k.lower() == "authorization" else v) for k, v in (headers or {}).items()}
     log.info(f"[task {self.request.id}] wp_update_plugins url={base_url} plugins={plugins} auto={auto_select_outdated} headers={bool(headers)} auth={bool(auth)}")
 
     try:
@@ -110,32 +102,76 @@ def wp_update_plugins_task(self,
         return {"ok": False, "error": f"Import error: {e}"}
 
     auth_tuple = (auth["username"], auth["password"]) if auth else None
-
-    selected = list(plugins or [])
     status = None
-    if auto_select_outdated and not selected:
+
+    # Helper: map human plugin names -> plugin_file slugs using status
+    def _normalize_plugin_list(sel: list[str], status_json: dict | None) -> list[str]:
+        if not sel:
+            return []
+        if not status_json:
+            return sel
+        by_name = {
+            (p.get("name") or "").lower(): (p.get("plugin_file") or "")
+            for p in (status_json.get("plugins") or [])
+        }
+        norm = []
+        for s in sel:
+            s_str = str(s or "")
+            # If already looks like a slug (dir/file.php), keep it
+            if "/" in s_str and s_str.endswith(".php"):
+                norm.append(s_str)
+            else:
+                slug = by_name.get(s_str.lower())
+                norm.append(slug or s_str)  # fall back if unknown
+        return norm
+
+    # 1) Decide selection
+    selected = list(plugins or [])
+
+    # Fetch status when:
+    #  - we need to auto-select, or
+    #  - we need to normalize provided names into slugs
+    need_status_for_normalize = any(selected) and any(("/" not in s or not s.endswith(".php")) for s in selected)
+    if (auto_select_outdated and not selected) or need_status_for_normalize:
         try:
             status = fetch_status(base_url, auth_tuple, headers)
-            selected = select_outdated_plugins(status, blocklist)
         except Exception as e:
             return {"ok": False, "error": f"Status fetch failed: {e}", "url": base_url}
 
-    if not selected:
-        result = {"ok": True, "updated": [], "message": "No plugins selected/outdated"}
+    if auto_select_outdated and not selected:
+        selected = select_outdated_plugins(status, blocklist)
     else:
-        result = update_plugins(base_url, selected, auth_tuple, headers)
-        result["selected"] = selected
-        result["blocklist"] = blocklist or []
+        selected = _normalize_plugin_list(selected, status)
 
+    # Apply blocklist if caller provided explicit selection
+    if blocklist:
+        bl = set(blocklist)
+        selected = [s for s in selected if s not in bl]
+
+    # 2) Build result shape to mirror `wp_update_all_task`
+    out = {
+        "ok": True,              # will be ANDed with inner result
+        "url": base_url,
+        "plugins": {"selected": selected, "skipped": False, "result": None},
+    }
     if status is not None:
-        result["status_snapshot"] = status
+        out["status_snapshot"] = status
+
+    # 3) Execute or skip
+    if not selected:
+        out["plugins"]["skipped"] = True
+    else:
+        upd = update_plugins(base_url, selected, auth_tuple, headers)
+        out["plugins"]["result"] = upd
+        out["ok"] = bool(upd.get("ok"))
 
     if report_email:
         try:
-            send_report_email(report_email, f"[{settings.APP_NAME}] WP plugin updates for {base_url}", result or {})
+            send_report_email(report_email, f"[{settings.APP_NAME}] WP plugin updates for {base_url}", out or {})
         except Exception as e:
-            result = {"_original": result, "_email_error": str(e)}
-    return result
+            out = {"_original": out, "_email_error": str(e)}
+    return out
+
 
 
 @celery.task(bind=True, name="wp.update.core")

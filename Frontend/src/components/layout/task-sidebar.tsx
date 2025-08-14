@@ -161,6 +161,26 @@ export function TaskSidebar({ isOpen, onClose }: TaskSidebarProps) {
       }
     }
     
+    // WordPress status results
+    if (result.wp_version) {
+      return `WordPress ${result.wp_version} detected. ${result.plugins_count || 0} plugins, ${result.themes_count || 0} themes installed.`;
+    }
+    
+    // Backup results
+    if (result.backup_path) {
+      return `Backup created successfully: ${result.backup_path}`;
+    }
+    
+    // SSL/Domain results
+    if (result.ssl_expires) {
+      return `SSL certificate expires: ${result.ssl_expires}. Domain: ${result.domain || 'Unknown'}`;
+    }
+    
+    // Health check results
+    if (result.response_time) {
+      return `Site responded in ${result.response_time}ms. Status: ${result.keyword_found ? 'Content found' : 'Content missing'}`;
+    }
+    
     if (result.message) return result.message;
     if (result.status) return result.status;
     

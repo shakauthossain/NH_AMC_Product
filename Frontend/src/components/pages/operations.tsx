@@ -1,6 +1,6 @@
 import { useState } from "react";
 import { motion } from "framer-motion";
-import { useMutation } from "@tanstack/react-query";
+import { useMutation, useQuery } from "@tanstack/react-query";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -8,6 +8,7 @@ import { Label } from "@/components/ui/label";
 import { Textarea } from "@/components/ui/textarea";
 import { Switch } from "@/components/ui/switch";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
+import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { useToast } from "@/hooks/use-toast";
 import { apiService, SiteConfig } from "@/lib/api";
 import { useTaskTracker } from "../layout/task-sidebar";
@@ -19,10 +20,23 @@ import {
   Eye, 
   Database,
   FolderOpen,
-  AlertTriangle
+  AlertTriangle,
+  Server
 } from "lucide-react";
 
+interface SavedConnection {
+  id: string;
+  name: string;
+  host: string;
+  user: string;
+  wp_path: string;
+  password?: string;
+  key_filename?: string;
+  private_key_pem?: string;
+}
+
 export function OperationsPage() {
+  const [selectedConnectionId, setSelectedConnectionId] = useState<string>("");
   const [siteConfig, setSiteConfig] = useState<SiteConfig>({
     host: "",
     user: "",
@@ -60,6 +74,34 @@ export function OperationsPage() {
   const { toast } = useToast();
   const { addTaskToTracker } = useTaskTracker();
 
+  // Load saved connections
+  const { data: savedConnections = [] } = useQuery({
+    queryKey: ['saved-connections'],
+    queryFn: () => {
+      const saved = localStorage.getItem('wp-dashboard-connections');
+      return saved ? JSON.parse(saved) : [];
+    },
+  });
+
+  // Update siteConfig when connection is selected
+  const handleConnectionChange = (connectionId: string) => {
+    setSelectedConnectionId(connectionId);
+    const connection = savedConnections.find((conn: SavedConnection) => conn.id === connectionId);
+    if (connection) {
+      setSiteConfig({
+        host: connection.host,
+        user: connection.user,
+        password: connection.password || "",
+        wp_path: connection.wp_path,
+        db_name: siteConfig.db_name,
+        db_user: siteConfig.db_user,
+        db_pass: siteConfig.db_pass,
+        key_filename: connection.key_filename || null,
+        private_key_pem: connection.private_key_pem || null,
+      });
+    }
+  };
+
   const wpStatusMutation = useMutation({
     mutationFn: () => apiService.getWpStatus(siteConfig),
     onSuccess: (data) => {
@@ -67,7 +109,7 @@ export function OperationsPage() {
         title: "WordPress status check queued",
         description: `Task ID: ${data.task_id}`,
       });
-      addTaskToTracker(data.task_id, "WordPress Status Check", "Checking WordPress installation status and version");
+      addTaskToTracker(data.task_id, "WordPress Status Check", "Analyzing WordPress core, plugins, themes, and system health");
     },
   });
 
@@ -78,7 +120,7 @@ export function OperationsPage() {
         title: "Backup queued",
         description: `Task ID: ${data.task_id}`,
       });
-      addTaskToTracker(data.task_id, "Full Backup", "Creating complete backup of database and wp-content");
+      addTaskToTracker(data.task_id, "Full Backup", "Compressing database, archiving wp-content, and securing backup files");
     },
   });
 
@@ -95,7 +137,7 @@ export function OperationsPage() {
           title: "Database backup queued",
           description: `Task ID: ${data.task_id}`,
         });
-        addTaskToTracker(data.task_id, "Database Backup", "Creating database backup");
+        addTaskToTracker(data.task_id, "Database Backup", "Exporting MySQL tables, compressing SQL dump, and preparing download");
       }
     },
   });
@@ -113,7 +155,7 @@ export function OperationsPage() {
           title: "Content backup queued",
           description: `Task ID: ${data.task_id}`,
         });
-        addTaskToTracker(data.task_id, "Content Backup", "Creating wp-content backup");
+        addTaskToTracker(data.task_id, "Content Backup", "Archiving themes, plugins, uploads, and media files");
       }
     },
   });
@@ -134,7 +176,7 @@ export function OperationsPage() {
         title: "WordPress update queued",
         description: `Task ID: ${data.task_id}`,
       });
-      addTaskToTracker(data.task_id, "WordPress Update", `Updating ${updateConfig.includeCore ? 'core' : ''}${updateConfig.includeCore && updateConfig.includePlugins ? ' and ' : ''}${updateConfig.includePlugins ? 'plugins' : ''}`);
+      addTaskToTracker(data.task_id, "WordPress Update", `Creating backup, updating ${updateConfig.includeCore ? 'WordPress core' : ''}${updateConfig.includeCore && updateConfig.includePlugins ? ' and ' : ''}${updateConfig.includePlugins ? 'plugins' : ''}, testing compatibility`);
     },
   });
 
@@ -151,7 +193,7 @@ export function OperationsPage() {
         title: "Health check queued",
         description: `Task ID: ${data.task_id}`,
       });
-      addTaskToTracker(data.task_id, "Health Check", `Checking ${healthCheckConfig.url} for "${healthCheckConfig.keyword}"`);
+      addTaskToTracker(data.task_id, "Health Check", `Loading page, searching for content, capturing screenshot, analyzing response time`);
     },
   });
 
@@ -162,7 +204,7 @@ export function OperationsPage() {
         title: "SSL check queued",
         description: `Task ID: ${data.task_id}`,
       });
-      addTaskToTracker(data.task_id, "SSL Check", `Checking SSL certificate for ${domain}`);
+      addTaskToTracker(data.task_id, "SSL Check", `Analyzing certificate chain, checking expiry date, validating domain ownership`);
     },
   });
 
@@ -191,7 +233,7 @@ export function OperationsPage() {
         title: "WordPress reset queued",
         description: `Task ID: ${data.task_id}`,
       });
-      addTaskToTracker(data.task_id, "WordPress Reset", `Resetting WordPress installation for ${resetConfig.domain}`);
+      addTaskToTracker(data.task_id, "WordPress Reset", `Stopping services, purging files, resetting database, cleaning configurations`);
     },
   });
 
@@ -212,75 +254,77 @@ export function OperationsPage() {
           <TabsTrigger value="reset">Reset</TabsTrigger>
         </TabsList>
 
-        {/* Server Configuration */}
+        {/* Server Connection Selection */}
         <Card className="dashboard-card">
           <CardHeader>
-            <CardTitle>Server Configuration</CardTitle>
+            <CardTitle className="flex items-center space-x-2">
+              <Server className="w-5 h-5" />
+              <span>Server Connection</span>
+            </CardTitle>
           </CardHeader>
-          <CardContent className="grid grid-cols-2 md:grid-cols-4 gap-4">
-            <div className="space-y-2">
-              <Label htmlFor="host">Host</Label>
-              <Input
-                id="host"
-                placeholder="203.0.113.45"
-                value={siteConfig.host}
-                onChange={(e) => setSiteConfig({ ...siteConfig, host: e.target.value })}
-              />
-            </div>
-            <div className="space-y-2">
-              <Label htmlFor="user">User</Label>
-              <Input
-                id="user"
-                placeholder="root"
-                value={siteConfig.user}
-                onChange={(e) => setSiteConfig({ ...siteConfig, user: e.target.value })}
-              />
-            </div>
-            <div className="space-y-2">
-              <Label htmlFor="password">Password</Label>
-              <Input
-                id="password"
-                type="password"
-                value={siteConfig.password || ''}
-                onChange={(e) => setSiteConfig({ ...siteConfig, password: e.target.value })}
-              />
-            </div>
-            <div className="space-y-2">
-              <Label htmlFor="wp_path">WP Path</Label>
-              <Input
-                id="wp_path"
-                placeholder="/var/www/html"
-                value={siteConfig.wp_path}
-                onChange={(e) => setSiteConfig({ ...siteConfig, wp_path: e.target.value })}
-              />
-            </div>
-            <div className="space-y-2">
-              <Label htmlFor="db_name">DB Name</Label>
-              <Input
-                id="db_name"
-                placeholder="wp_db"
-                value={siteConfig.db_name}
-                onChange={(e) => setSiteConfig({ ...siteConfig, db_name: e.target.value })}
-              />
-            </div>
-            <div className="space-y-2">
-              <Label htmlFor="db_user">DB User</Label>
-              <Input
-                id="db_user"
-                placeholder="wp_user"
-                value={siteConfig.db_user}
-                onChange={(e) => setSiteConfig({ ...siteConfig, db_user: e.target.value })}
-              />
-            </div>
-            <div className="space-y-2">
-              <Label htmlFor="db_pass">DB Password</Label>
-              <Input
-                id="db_pass"
-                type="password"
-                value={siteConfig.db_pass}
-                onChange={(e) => setSiteConfig({ ...siteConfig, db_pass: e.target.value })}
-              />
-            </div>
+          <CardContent>
+            {savedConnections.length === 0 ? (
+              <div className="text-center py-8 text-muted-foreground">
+                <Server className="w-12 h-12 mx-auto mb-4 opacity-50" />
+                <p>No server connections available</p>
+                <p className="text-sm">Please add a server connection first in the Connections page</p>
+              </div>
+            ) : (
+              <div className="space-y-4">
+                <div className="space-y-2">
+                  <Label htmlFor="connection">Select Connection</Label>
+                  <Select value={selectedConnectionId} onValueChange={handleConnectionChange}>
+                    <SelectTrigger>
+                      <SelectValue placeholder="Choose a saved connection" />
+                    </SelectTrigger>
+                    <SelectContent>
+                      {savedConnections.map((connection: SavedConnection) => (
+                        <SelectItem key={connection.id} value={connection.id}>
+                          <div className="flex items-center space-x-2">
+                            <span className="font-medium">{connection.name}</span>
+                            <span className="text-muted-foreground">
+                              ({connection.user}@{connection.host})
+                            </span>
+                          </div>
+                        </SelectItem>
+                      ))}
+                    </SelectContent>
+                  </Select>
+                </div>
+                
+                {selectedConnectionId && (
+                  <div className="grid grid-cols-3 gap-4 pt-4 border-t">
+                    <div className="space-y-2">
+                      <Label htmlFor="db_name">DB Name</Label>
+                      <Input
+                        id="db_name"
+                        placeholder="wp_db"
+                        value={siteConfig.db_name}
+                        onChange={(e) => setSiteConfig({ ...siteConfig, db_name: e.target.value })}
+                      />
+                    </div>
+                    <div className="space-y-2">
+                      <Label htmlFor="db_user">DB User</Label>
+                      <Input
+                        id="db_user"
+                        placeholder="wp_user"
+                        value={siteConfig.db_user}
+                        onChange={(e) => setSiteConfig({ ...siteConfig, db_user: e.target.value })}
+                      />
+                    </div>
+                    <div className="space-y-2">
+                      <Label htmlFor="db_pass">DB Password</Label>
+                      <Input
+                        id="db_pass"
+                        type="password"
+                        value={siteConfig.db_pass}
+                        onChange={(e) => setSiteConfig({ ...siteConfig, db_pass: e.target.value })}
+                      />
+                    </div>
+                  </div>
+                )}
+              </div>
+            )}
           </CardContent>
         </Card>
 
@@ -296,13 +340,13 @@ export function OperationsPage() {
               <p className="text-muted-foreground mb-4">
                 Check WordPress installation status, version, and plugin information
               </p>
-              <Button
-                onClick={() => wpStatusMutation.mutate()}
-                disabled={wpStatusMutation.isPending || !siteConfig.host}
-                className="btn-primary"
-              >
-                {wpStatusMutation.isPending ? "Checking..." : "Check WordPress Status"}
-              </Button>
+                <Button
+                  onClick={() => wpStatusMutation.mutate()}
+                  disabled={wpStatusMutation.isPending || !selectedConnectionId}
+                  className="btn-primary"
+                >
+                  {wpStatusMutation.isPending ? "Checking..." : "Check WordPress Status"}
+                </Button>
             </CardContent>
           </Card>
         </TabsContent>
@@ -326,7 +370,7 @@ export function OperationsPage() {
                 </div>
                 <Button
                   onClick={() => backupDbMutation.mutate()}
-                  disabled={backupDbMutation.isPending || !siteConfig.host}
+                  disabled={backupDbMutation.isPending || !selectedConnectionId}
                   className="w-full"
                 >
                   {backupDbMutation.isPending ? "Creating..." : "Backup Database"}
@@ -351,7 +395,7 @@ export function OperationsPage() {
                 </div>
                 <Button
                   onClick={() => backupContentMutation.mutate()}
-                  disabled={backupContentMutation.isPending || !siteConfig.host}
+                  disabled={backupContentMutation.isPending || !selectedConnectionId}
                   className="w-full"
                 >
                   {backupContentMutation.isPending ? "Creating..." : "Backup wp-content"}
@@ -373,7 +417,7 @@ export function OperationsPage() {
               </p>
               <Button
                 onClick={() => backupMutation.mutate()}
-                disabled={backupMutation.isPending || !siteConfig.host}
+                disabled={backupMutation.isPending || !selectedConnectionId}
                 className="btn-primary"
               >
                 {backupMutation.isPending ? "Creating..." : "Create Full Backup"}
@@ -453,7 +497,7 @@ export function OperationsPage() {
 
               <Button
                 onClick={() => updateMutation.mutate()}
-                disabled={updateMutation.isPending || !updateConfig.baseUrl}
+                disabled={updateMutation.isPending || !updateConfig.baseUrl || !selectedConnectionId}
                 className="btn-primary"
               >
                 {updateMutation.isPending ? "Updating..." : "Start Update Process"}

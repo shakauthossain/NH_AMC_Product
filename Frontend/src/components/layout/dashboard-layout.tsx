@@ -144,8 +144,8 @@ export function DashboardLayout({ children, currentPage, onPageChange }: Dashboa
           ))}
         </nav>
 
-        {/* Settings & Reset */}
-        <div className="p-4 border-t border-sidebar-border space-y-1">
+        {/* Settings */}
+        <div className="p-4 border-t border-sidebar-border">
           <Button
             variant={currentPage === 'settings' ? "default" : "ghost"}
             className={cn(
@@ -161,20 +161,6 @@ export function DashboardLayout({ children, currentPage, onPageChange }: Dashboa
           >
             <Settings className="w-4 h-4 mr-3" />
             Settings
-          </Button>
-          
-          <Button
-            variant="ghost"
-            className="w-full justify-start text-destructive hover:text-destructive hover:bg-destructive/10"
-            onClick={() => {
-              if (confirm('Are you sure you want to reset all data? This will clear all connections, tasks, and settings.')) {
-                localStorage.clear();
-                window.location.reload();
-              }
-            }}
-          >
-            <X className="w-4 h-4 mr-3" />
-            Reset All Data
           </Button>
         </div>
       </motion.aside>

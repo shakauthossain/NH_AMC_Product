@@ -61,7 +61,7 @@ export function ProvisionPage() {
         description: `Task ID: ${data.task_id}`,
       });
       
-      addTaskToTracker(data.task_id, "WordPress Installation", `Installing WordPress for ${installConfig.domain}`);
+      addTaskToTracker(data.task_id, "WordPress Installation", `Installing LEMP stack, configuring PHP ${installConfig.php_version}, downloading WordPress ${installConfig.wp_version}, setting up database`);
       
       // Reset form
       setInstallConfig({
@@ -101,10 +101,10 @@ export function ProvisionPage() {
       return;
     }
 
-    if (!installConfig.domain || !installConfig.site_title || !installConfig.admin_email) {
+    if (!installConfig.site_title || !installConfig.admin_email) {
       toast({
         title: "Missing required fields",
-        description: "Please fill in domain, site title, and admin email",
+        description: "Please fill in site title, and admin email",
         variant: "destructive",
       });
       return;
@@ -190,7 +190,7 @@ export function ProvisionPage() {
                   placeholder="example.com"
                   value={installConfig.domain}
                   onChange={(e) => setInstallConfig({ ...installConfig, domain: e.target.value })}
-                  required
+                  // required
                 />
               </div>
               <div className="space-y-2">

@@ -17,7 +17,7 @@ export interface SiteConfig extends SiteConnection {
 }
 
 export interface WPInstallRequest {
-  domain: string;
+  domain?: string;
   wp_path: string;
   site_title: string;
   admin_user: string;
