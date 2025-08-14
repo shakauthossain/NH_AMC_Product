@@ -638,8 +638,8 @@ export function WPStatusPage() {
                                  </Badge>
                                )}
                              </div>
-                              <div>
-                                {hasUpdate && (
+                             <div>
+                               {hasUpdate && (
                                   <Button
                                     size="sm"
                                     variant="outline"
@@ -647,17 +647,17 @@ export function WPStatusPage() {
                                     disabled={isUpdating}
                                     className="h-8"
                                   >
-                                    {isUpdating ? (
-                                      <>
-                                        <RefreshCw className="w-3 h-3 mr-1 animate-spin" />
-                                        Updating...
-                                      </>
-                                    ) : (
-                                      'Update'
-                                    )}
-                                  </Button>
-                                )}
-                              </div>
+                                   {isUpdating ? (
+                                     <>
+                                       <RefreshCw className="w-3 h-3 mr-1 animate-spin" />
+                                       Updating...
+                                     </>
+                                   ) : (
+                                     'Update'
+                                   )}
+                                 </Button>
+                               )}
+                             </div>
                            </div>
                             );
                           })}
@@ -707,26 +707,26 @@ export function WPStatusPage() {
                                  </Badge>
                                )}
                              </div>
-                              <div>
-                                {hasUpdate && (
-                                   <Button
-                                     size="sm"
-                                     variant="outline"
-                                     onClick={() => openUpdateDialog(theme.name, 'theme')}
-                                     disabled={isUpdating}
-                                     className="h-8"
-                                   >
-                                    {isUpdating ? (
-                                      <>
-                                        <RefreshCw className="w-3 h-3 mr-1 animate-spin" />
-                                        Updating...
-                                      </>
-                                    ) : (
-                                      'Update'
-                                    )}
-                                  </Button>
-                                )}
-                              </div>
+                             <div>
+                               {hasUpdate && (
+                                  <Button
+                                    size="sm"
+                                    variant="outline"
+                                    onClick={() => openUpdateDialog(theme.name, 'theme')}
+                                    disabled={isUpdating}
+                                    className="h-8"
+                                  >
+                                   {isUpdating ? (
+                                     <>
+                                       <RefreshCw className="w-3 h-3 mr-1 animate-spin" />
+                                       Updating...
+                                     </>
+                                   ) : (
+                                     'Update'
+                                   )}
+                                 </Button>
+                               )}
+                             </div>
                            </div>
                             );
                           })}
