@@ -456,6 +456,79 @@ if [ -n "$DOMAIN" ] && [ -n "$LETSENCRYPT_EMAIL" ] && [ "$S_NGINX" = "ok" ]; the
   fi
 fi
 
+# -------------------- Plugin Update Hardening (add-only) --------------------
+log "Applying plugin-update hardening (timeouts, auth header, FS perms)…"
+
+# 1) Nginx: ensure Authorization header forwarded + generous timeouts in PHP location
+if [ "$S_NGINX" = "ok" ]; then
+  SITENAME="${DOMAIN:-default}"
+  NGX_AV="/etc/nginx/sites-available/${SITENAME}"
+
+  if [ -f "$NGX_AV" ]; then
+    # Insert only if missing
+    if ! grep -q 'HTTP_AUTHORIZATION' "$NGX_AV"; then
+      awk '
+        { print }
+        /location ~ \\.php\\$/ && !ins { ins=1; print "        fastcgi_param HTTP_AUTHORIZATION $http_authorization;"; print "        fastcgi_read_timeout 600s;"; print "        fastcgi_send_timeout 600s;"; }
+      ' "$NGX_AV" > "${NGX_AV}.tmp" && mv "${NGX_AV}.tmp" "$NGX_AV"
+    fi
+    if ! grep -q 'fastcgi_read_timeout 600s' "$NGX_AV"; then
+      sed -i '/location ~ \.php\$/,/}/ s|^\(\s*\)include snippets/fastcgi-php.conf;|\0\n\1fastcgi_read_timeout 600s;\n\1fastcgi_send_timeout 600s;|' "$NGX_AV"
+    fi
+    safe nginx -t && safe systemctl reload nginx
+  else
+    mark_warn "Nginx site file not found for timeout/auth insert ($NGX_AV)"
+  fi
+fi
+
+# 2) PHP: raise execution/memory + FPM request timeout (non-destructive edits)
+detect_php_version
+PHP_INI="$(php -i 2>/dev/null | awk -F'=> ' '/Loaded Configuration File/ {print $2}')"
+if [ -n "$PHP_INI" ] && [ -f "$PHP_INI" ]; then
+  sed -i 's/^;*\s*memory_limit\s*=.*/memory_limit = 512M/' "$PHP_INI" || true
+  sed -i 's/^;*\s*max_execution_time\s*=.*/max_execution_time = 600/' "$PHP_INI" || true
+  sed -i 's/^;*\s*post_max_size\s*=.*/post_max_size = 128M/' "$PHP_INI" || true
+  sed -i 's/^;*\s*upload_max_filesize\s*=.*/upload_max_filesize = 128M/' "$PHP_INI" || true
+fi
+
+if [ -n "$PHP_EFF_VER" ] && [ -d "/etc/php/${PHP_EFF_VER}/fpm/pool.d" ]; then
+  cat >/etc/php/${PHP_EFF_VER}/fpm/pool.d/zz-plugin-updates.conf <<EOF
+; Added for long-running plugin updates
+request_terminate_timeout = 600s
+pm.max_requests = 500
+EOF
+  safe systemctl reload "php${PHP_EFF_VER}-fpm"
+fi
+
+# 3) WordPress runtime: ensure direct FS writes + ample memory
+if [ -f "$WP_PATH/wp-config.php" ]; then
+  if ! grep -q "FS_METHOD" "$WP_PATH/wp-config.php"; then
+    printf "\ndefine('FS_METHOD','direct');\n" >> "$WP_PATH/wp-config.php"
+  fi
+  if ! grep -q "WP_MEMORY_LIMIT" "$WP_PATH/wp-config.php"; then
+    printf "define('WP_MEMORY_LIMIT','512M');\n" >> "$WP_PATH/wp-config.php"
+  fi
+fi
+
+# 4) Ensure required auth plugin present (idempotent) + preinstall big plugin to warm caches
+if command -v "$wp_bin" >/dev/null 2>&1; then
+  # JSON Basic Auth for REST
+  wp_run plugin install json-basic-authentication --activate >/dev/null 2>&1 || true
+
+  # (Optional but helpful) make sure target plugin exists before REST updating
+  # This reduces time spent fetching during REST calls and avoids first-time unzip delays.
+  wp_run plugin install all-in-one-wp-migration --activate >/dev/null 2>&1 || true
+
+  # Flush rewrite just in case REST routes changed
+  wp_run rewrite flush --hard >/dev/null 2>&1 || true
+fi
+
+# 5) Final: reload Nginx once more after PHP changes
+if command -v nginx >/dev/null 2>&1; then
+  safe nginx -t && safe systemctl reload nginx
+fi
+# ------------------ end Plugin Update Hardening ------------------
+
 # -------------------- Report --------------------
 mkdir -p "$(dirname "$REPORT_PATH")" 2>/dev/null || true
 {

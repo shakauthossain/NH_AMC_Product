@@ -105,28 +105,39 @@ def wp_update_plugins_task(self,
     status = None
 
     # Helper: map human plugin names -> plugin_file slugs using status
+    # Helper: map slug OR name -> plugin_file using status
     def _normalize_plugin_list(sel: list[str], status_json: dict | None) -> list[str]:
+        """
+        Accepts:
+        - plugin_file: "dir/file.php" OR "hello.php"  (pass through)
+        - slug:        "all-in-one-wp-migration"      (map -> "all-in-one-wp-migration/all-in-one-wp-migration.php")
+        - name:        "All-in-One WP Migration"      (map -> plugin_file)
+        """
         if not sel:
             return []
         if not status_json:
             return sel
-        by_name = {
-            (p.get("name") or "").lower(): (p.get("plugin_file") or "")
-            for p in (status_json.get("plugins") or [])
-        }
-        norm = []
+
+        plugins = status_json.get("plugins") or []
+        by_slug = { (p.get("slug") or "").strip().lower(): (p.get("plugin_file") or "") for p in plugins }
+        by_name = { (p.get("name") or "").strip().lower(): (p.get("plugin_file") or "") for p in plugins }
+
+        out: list[str] = []
         for s in sel:
-            s_str = str(s or "")
-            # If already looks like a slug (dir/file.php), keep it
-            if "/" in s_str and s_str.endswith(".php"):
-                norm.append(s_str)
-            else:
-                slug = by_name.get(s_str.lower())
-                norm.append(slug or s_str)  # fall back if unknown
-        return norm
+            s0 = (str(s or "").strip())
+            # Already a plugin_file? (handles both "hello.php" and "dir/file.php")
+            if s0.endswith(".php"):
+                out.append(s0)
+                continue
+            # Try slug, then human name
+            pf = by_slug.get(s0.lower()) or by_name.get(s0.lower())
+            out.append(pf or s0)  # fall back if unknown
+        # Drop empties just in case
+        return [x for x in out if x]
 
     # 1) Decide selection
     selected = list(plugins or [])
+    selected_before = list(plugins or [])
 
     # Fetch status when:
     #  - we need to auto-select, or
@@ -164,6 +175,8 @@ def wp_update_plugins_task(self,
         upd = update_plugins(base_url, selected, auth_tuple, headers)
         out["plugins"]["result"] = upd
         out["ok"] = bool(upd.get("ok"))
+    
+    log.info(f"[task {self.request.id}] normalize: {selected_before} -> {selected}")
 
     if report_email:
         try:
