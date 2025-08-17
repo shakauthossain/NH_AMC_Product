@@ -6,3 +6,29 @@ sudo chown -R www-data:www-data /var/www/html
 sudo chgrp -R www-data /var/www/html
 find /var/www/html -type d -exec chmod 775 {} \;
 find /var/www/html -type f -exec chmod 664 {} \;
+
+/etc/nginx/sites-available/default
+
+location ~ \.php$ {
+    include snippets/fastcgi-php.conf;
+    fastcgi_pass unix:/run/php/php8.4-fpm.sock;  # adjust if different
+
+    # timeouts for long plugin updates
+    fastcgi_read_timeout 600s;
+    fastcgi_send_timeout 600s;
+    fastcgi_connect_timeout 60s;
+
+    # optional buffers for big responses (safe defaults)
+    fastcgi_buffers 16 32k;
+    fastcgi_buffer_size 64k;
+}
+
+sudo nginx -t && sudo systemctl reload nginx
+
+/etc/php/8.4/fpm/pool.d/www.conf
+
+request_terminate_timeout = 900
+pm.max_children = 10           ; increase if you see 502 under load
+pm.max_requests = 1000
+
+sudo systemctl restart php8.4-fpm

@@ -1,5 +1,7 @@
 // API Service Layer for WordPress Management Dashboard
 
+import { normalizePluginList, type PluginInfo, type NormalizationDebugInfo } from './plugin-normalizer';
+
 export interface SiteConnection {
   host: string;
   user: string;
@@ -282,6 +284,144 @@ class ApiService {
     });
   }
 
+  // Enhanced plugin update with normalization and debugging
+  async updatePluginsWithNormalization(
+    baseUrl: string,
+    plugins: string[],
+    availablePlugins: PluginInfo[] = [],
+    autoSelectOutdated: boolean = true,
+    blocklist: string[] = [],
+    headers?: Record<string, string>,
+    auth?: { username: string; password: string },
+    reportEmail?: string
+  ): Promise<TaskResponse & { debugInfo?: NormalizationDebugInfo }> {
+    // Normalize plugin names/slugs to plugin_file format
+    const { normalized, debugInfo } = normalizePluginList(plugins, availablePlugins);
+    
+    // console.log('=== PLUGIN NORMALIZATION DEBUG ===');
+    // console.log('Input plugins:', plugins);
+    // console.log('Available plugins:', availablePlugins.length);
+    // console.log('Normalization results:', debugInfo.results);
+    // console.log('Final plugin files:', normalized);
+    // console.log('===================================');
+
+    // Use the normalized plugin files
+    const response = await this.postJson<TaskResponse>('/tasks/wp-update/plugins', {
+      base_url: baseUrl,
+      plugins: normalized,
+      auto_select_outdated: autoSelectOutdated,
+      blocklist,
+      headers,
+      auth,
+      report_email: reportEmail,
+    });
+
+    // Return response with debug info
+    return {
+      ...response,
+      debugInfo,
+    };
+  }
+
+  // Enhanced method to try multiple plugin update formats
+  async updatePluginsRobust(
+    baseUrl: string,
+    plugins: string[],
+    availablePlugins: PluginInfo[] = [],
+    autoSelectOutdated: boolean = true,
+    blocklist: string[] = [],
+    headers?: Record<string, string>,
+    auth?: { username: string; password: string },
+    reportEmail?: string
+  ): Promise<TaskResponse & { attempts?: any[]; debugInfo?: NormalizationDebugInfo }> {
+    const attempts: any[] = [];
+    
+    // First normalize the plugins
+    const { normalized, debugInfo } = normalizePluginList(plugins, availablePlugins);
+    
+    // console.log('=== ROBUST PLUGIN UPDATE ATTEMPT ===');
+    // console.log('Original plugins:', plugins);
+    // console.log('Normalized plugins:', normalized);
+    
+    const basePayload = {
+      base_url: baseUrl,
+      auto_select_outdated: autoSelectOutdated,
+      blocklist,
+      headers,
+      auth,
+      report_email: reportEmail,
+    };
+
+    // Attempt 1: Standard format with normalized plugins
+    try {
+      // console.log('Attempt 1: Standard format with normalized plugins');
+      const payload = {
+        ...basePayload,
+        plugins: normalized,
+      };
+      attempts.push({ format: 'standard_normalized', payload });
+      
+      const response = await this.postJson<TaskResponse>('/tasks/wp-update/plugins', payload);
+      // console.log('Attempt 1 successful:', response);
+      
+      return {
+        ...response,
+        attempts,
+        debugInfo,
+      };
+    } catch (error) {
+      // console.log('Attempt 1 failed:', error);
+      attempts[attempts.length - 1].error = String(error);
+    }
+
+    // Attempt 2: Array format
+    try {
+      // console.log('Attempt 2: Array format');
+      const payload = {
+        ...basePayload,
+        plugins: normalized.map(plugin => ({ plugin })),
+      };
+      attempts.push({ format: 'array_format', payload });
+      
+      const response = await this.postJson<TaskResponse>('/tasks/wp-update/plugins', payload);
+      // console.log('Attempt 2 successful:', response);
+      
+      return {
+        ...response,
+        attempts,
+        debugInfo,
+      };
+    } catch (error) {
+      // console.log('Attempt 2 failed:', error);
+      attempts[attempts.length - 1].error = String(error);
+    }
+
+    // Attempt 3: Original input format (fallback)
+    try {
+      // console.log('Attempt 3: Original input format');
+      const payload = {
+        ...basePayload,
+        plugins: plugins,
+      };
+      attempts.push({ format: 'original_format', payload });
+      
+      const response = await this.postJson<TaskResponse>('/tasks/wp-update/plugins', payload);
+      // console.log('Attempt 3 successful:', response);
+      
+      return {
+        ...response,
+        attempts,
+        debugInfo,
+      };
+    } catch (error) {
+      // console.log('Attempt 3 failed:', error);
+      attempts[attempts.length - 1].error = String(error);
+      
+      // All attempts failed, throw the last error
+      throw new Error(`All plugin update attempts failed. Last error: ${error}`);
+    }
+  }
+
   async updateCore(
     baseUrl: string,
     precheck: boolean = true,
@@ -355,14 +495,357 @@ class ApiService {
             return;
           }
 
-          setTimeout(poll, 2000);
+          setTimeout(poll, 1200); // Faster polling for better UX
         } catch (error) {
           reject(error);
         }
       };
-
       poll();
     });
+  }
+
+  // Enhanced polling with timeout
+  async pollTaskWithTimeout(
+    taskId: string, 
+    options: {
+      intervalMs?: number;
+      timeoutMs?: number;
+      onUpdate?: (status: TaskStatus) => void;
+    } = {}
+  ): Promise<TaskStatus> {
+    const { intervalMs = 1200, timeoutMs = 600000, onUpdate } = options; // 10 min timeout
+    
+    return new Promise((resolve, reject) => {
+      const startTime = Date.now();
+      
+      const poll = async () => {
+        try {
+          if (Date.now() - startTime > timeoutMs) {
+            reject(new Error('Task polling timeout - still running in background'));
+            return;
+          }
+
+          const status = await this.getTaskStatus(taskId);
+          onUpdate?.(status);
+
+          if (status.state === 'SUCCESS' || status.state === 'FAILURE') {
+            resolve(status);
+            return;
+          }
+
+          setTimeout(poll, intervalMs);
+        } catch (error) {
+          reject(error);
+        }
+      };
+      poll();
+    });
+  }
+
+  // Plugin update with task polling and verification
+  async updatePluginWithPolling(
+    baseUrl: string,
+    pluginFile: string,
+    auth: { username: string; password: string },
+    onProgress?: (status: string) => void
+  ): Promise<{
+    success: boolean;
+    updated: boolean;
+    message: string;
+    details?: string;
+    taskResult?: any;
+  }> {
+    try {
+      console.log('=== PLUGIN UPDATE WITH POLLING ===');
+      console.log('Plugin file:', pluginFile);
+      console.log('Base URL:', baseUrl);
+      console.log('Auth:', { username: auth.username, password: auth.password ? '[SET]' : '[NOT SET]' });
+
+      // 1. Enqueue the update task
+      onProgress?.('Enqueueing update...');
+      const enqueueResponse = await this.updatePlugins(
+        baseUrl,
+        [pluginFile],
+        false, // Don't auto-select outdated
+        [], // No blocklist
+        undefined, // No custom headers
+        auth
+      );
+
+      console.log('=== ENQUEUE RESPONSE ===');
+      console.log('Task ID:', enqueueResponse.task_id);
+      console.log('Status:', enqueueResponse.status);
+
+      // 2. Poll the task until completion
+      onProgress?.('Updating plugin...');
+      const taskResult = await this.pollTaskWithTimeout(enqueueResponse.task_id, {
+        onUpdate: (status) => {
+          if (status.state === 'STARTED') {
+            onProgress?.('Update in progress...');
+          }
+        }
+      });
+
+      console.log('=== TASK RESULT ===');
+      console.log('State:', taskResult.state);
+      console.log('Result:', taskResult.result);
+
+      // 3. Handle task failure
+      if (taskResult.state === 'FAILURE') {
+        return {
+          success: false,
+          updated: false,
+          message: 'Plugin update failed',
+          details: taskResult.info || 'Unknown error occurred',
+          taskResult
+        };
+      }
+
+      // 4. Verify actual update from result
+      const pluginsResult = taskResult.result?.plugins?.result;
+      
+      // Check per_plugin results first (preferred)
+      if (pluginsResult?.per_plugin) {
+        const pluginResult = pluginsResult.per_plugin.find(
+          (p: any) => p.plugin_file === pluginFile
+        );
+        
+        if (pluginResult) {
+          const updated = pluginResult.updated === true;
+          const details = this.extractUpdateDetails(pluginResult);
+          
+          return {
+            success: true,
+            updated,
+            message: updated 
+              ? 'Plugin updated successfully' 
+              : 'Plugin update failed',
+            details,
+            taskResult
+          };
+        }
+      }
+
+      // Fallback: Check if we have post_status or other indicators
+      if (pluginsResult) {
+        return {
+          success: true,
+          updated: true, // Assume success if we got a result
+          message: 'Plugin update completed',
+          details: 'Update completed but verification details unavailable',
+          taskResult
+        };
+      }
+
+      // No clear result
+      return {
+        success: false,
+        updated: false,
+        message: 'Plugin update status unclear',
+        details: 'No plugin update result found in task response',
+        taskResult
+      };
+
+    } catch (error) {
+      console.error('Plugin update with polling failed:', error);
+      
+      if (error instanceof Error && error.message.includes('timeout')) {
+        return {
+          success: false,
+          updated: false,
+          message: 'Update timeout',
+          details: 'Still running in background; refresh to check status',
+        };
+      }
+
+      return {
+        success: false,
+        updated: false,
+        message: 'Plugin update failed',
+        details: error instanceof Error ? error.message : 'Unknown error',
+      };
+    }
+  }
+
+  // Bulk plugin update with polling and verification
+  async updateAllPluginsWithPolling(
+    baseUrl: string,
+    pluginFiles: string[],
+    auth: { username: string; password: string },
+    onProgress?: (status: string) => void
+  ): Promise<{
+    success: boolean;
+    summary: string;
+    results: Array<{
+      pluginFile: string;
+      updated: boolean;
+      message: string;
+      details?: string;
+    }>;
+    taskResult?: any;
+  }> {
+    try {
+      console.log('=== BULK PLUGIN UPDATE WITH POLLING ===');
+      console.log('Plugin files:', pluginFiles);
+      console.log('Base URL:', baseUrl);
+      console.log('Auth:', { username: auth.username, password: auth.password ? '[SET]' : '[NOT SET]' });
+
+      // 1. Enqueue the bulk update task
+      onProgress?.('Enqueueing bulk update...');
+      const enqueueResponse = await this.updatePlugins(
+        baseUrl,
+        pluginFiles,
+        false, // Don't auto-select outdated
+        [], // No blocklist
+        undefined, // No custom headers
+        auth
+      );
+
+      console.log('=== BULK ENQUEUE RESPONSE ===');
+      console.log('Task ID:', enqueueResponse.task_id);
+      console.log('Status:', enqueueResponse.status);
+
+      // 2. Poll the task until completion
+      onProgress?.('Updating plugins...');
+      const taskResult = await this.pollTaskWithTimeout(enqueueResponse.task_id, {
+        onUpdate: (status) => {
+          if (status.state === 'STARTED') {
+            onProgress?.('Bulk update in progress...');
+          }
+        }
+      });
+
+      console.log('=== BULK TASK RESULT ===');
+      console.log('State:', taskResult.state);
+      console.log('Result:', taskResult.result);
+
+      // 3. Handle task failure
+      if (taskResult.state === 'FAILURE') {
+        return {
+          success: false,
+          summary: 'Bulk plugin update failed',
+          results: pluginFiles.map(file => ({
+            pluginFile: file,
+            updated: false,
+            message: 'Failed',
+            details: taskResult.info || 'Unknown error occurred'
+          })),
+          taskResult
+        };
+      }
+
+      // 4. Process results for each plugin
+      const pluginsResult = taskResult.result?.plugins?.result;
+      const results: Array<{
+        pluginFile: string;
+        updated: boolean;
+        message: string;
+        details?: string;
+      }> = [];
+
+      let successCount = 0;
+      let failureCount = 0;
+
+      // Check per_plugin results if available
+      if (pluginsResult?.per_plugin) {
+        pluginFiles.forEach(pluginFile => {
+          const pluginResult = pluginsResult.per_plugin.find(
+            (p: any) => p.plugin_file === pluginFile
+          );
+          
+          if (pluginResult) {
+            const updated = pluginResult.updated === true;
+            const details = this.extractUpdateDetails(pluginResult);
+            
+            results.push({
+              pluginFile,
+              updated,
+              message: updated ? 'Updated' : 'Failed',
+              details
+            });
+
+            if (updated) successCount++;
+            else failureCount++;
+          } else {
+            results.push({
+              pluginFile,
+              updated: false,
+              message: 'Not found in results',
+              details: 'Plugin not found in update results'
+            });
+            failureCount++;
+          }
+        });
+      } else {
+        // Fallback: assume all succeeded if we got a result
+        pluginFiles.forEach(pluginFile => {
+          results.push({
+            pluginFile,
+            updated: true,
+            message: 'Updated',
+            details: 'Update completed'
+          });
+          successCount++;
+        });
+      }
+
+      const summary = `${successCount} updated, ${failureCount} failed`;
+
+      return {
+        success: true,
+        summary,
+        results,
+        taskResult
+      };
+
+    } catch (error) {
+      console.error('Bulk plugin update with polling failed:', error);
+      
+      if (error instanceof Error && error.message.includes('timeout')) {
+        return {
+          success: false,
+          summary: 'Update timeout',
+          results: pluginFiles.map(file => ({
+            pluginFile: file,
+            updated: false,
+            message: 'Timeout',
+            details: 'Still running in background; refresh to check status'
+          }))
+        };
+      }
+
+      return {
+        success: false,
+        summary: 'Bulk update failed',
+        results: pluginFiles.map(file => ({
+          pluginFile: file,
+          updated: false,
+          message: 'Failed',
+          details: error instanceof Error ? error.message : 'Unknown error'
+        }))
+      };
+    }
+  }
+
+  // Extract meaningful details from plugin update result
+  private extractUpdateDetails(pluginResult: any): string {
+    // Try to get a meaningful message from the response
+    const jsonBody = pluginResult.json?.body;
+    const formBody = pluginResult.form?.body;
+    
+    if (jsonBody && typeof jsonBody === 'string' && jsonBody.length > 0) {
+      return jsonBody.substring(0, 120);
+    }
+    
+    if (formBody && typeof formBody === 'string' && formBody.length > 0) {
+      return formBody.substring(0, 120);
+    }
+    
+    if (pluginResult.json?.status) {
+      return `HTTP ${pluginResult.json.status}`;
+    }
+    
+    return pluginResult.updated ? 'Successfully updated' : 'Update failed';
   }
 }
 

@@ -1,21 +1,114 @@
 <?php
-/**
- * REST endpoints for status + updates (core/plugins)
- * - /wp-json/site/v1/status            (GET, supports ?refresh=1)
- * - /wp-json/custom/v1/update-plugins  (POST, accepts ["a/b.php", ...] or {"plugins":"all"})
- * - /wp-json/custom/v1/update-core     (POST)
- */
-
 // Ensure admin update APIs are available
 require_once ABSPATH . 'wp-admin/includes/update.php';
 require_once ABSPATH . 'wp-admin/includes/plugin.php';
 require_once ABSPATH . 'wp-admin/includes/theme.php';
 require_once ABSPATH . 'wp-admin/includes/class-wp-upgrader.php';
+require_once ABSPATH . 'wp-admin/includes/file.php';
 
+/* =========================================================
+   GLOBAL TWEAKS
+   ========================================================= */
+// Keep temp inside wp-content/upgrade to avoid cross-device moves
+if ( ! defined('WP_TEMP_DIR') ) {
+  define('WP_TEMP_DIR', WP_CONTENT_DIR . '/upgrade');
+}
+// Give network calls more time (e.g., large plugin zips)
+add_filter('http_request_timeout', function ($t) { return max((int)$t, 300); });
 
-/* ===========================
+/* =========================================================
+   RESCUE HELPERS + ROUTES
+   ========================================================= */
+
+/** Copy extracted plugin from wp-content/upgrade into wp-content/plugins */
+function nh_rescue_plugin_from_source($source){
+  if(!is_dir($source)) return new WP_Error('no_source','Source not found: '.$source);
+
+  // Use single inner dir if present (usual zip layout)
+  $inner = null;
+  foreach (glob(trailingslashit($source).'*') as $e) { if(is_dir($e)){ $inner=$e; break; } }
+  if(!$inner) $inner = $source;
+
+  $slug = basename($inner);
+  $dest = trailingslashit(WP_PLUGIN_DIR).$slug;
+
+  WP_Filesystem();
+  global $wp_filesystem;
+  if ( ! $wp_filesystem->is_dir(dirname($dest)) ) wp_mkdir_p(dirname($dest));
+  if ( $wp_filesystem->exists($dest) ) $wp_filesystem->delete($dest, true);
+
+  $ok = copy_dir($inner, $dest);
+  if ( is_wp_error($ok) ) return $ok;
+
+  // best-effort perms
+  @chmod($dest, 0755);
+  if ( class_exists('RecursiveIteratorIterator') ) {
+    $it = new RecursiveIteratorIterator(
+      new RecursiveDirectoryIterator($dest, FilesystemIterator::SKIP_DOTS),
+      RecursiveIteratorIterator::SELF_FIRST
+    );
+    foreach($it as $p){ @chmod($p->getPathname(), $p->isDir()?0755:0644); }
+  }
+  return ['slug'=>$slug,'dest'=>$dest];
+}
+
+/** Scan wp-content/upgrade for a folder matching the plugin slug and rescue it */
+function nh_rescue_plugin_if_stuck($slug){
+  $upgrade = trailingslashit(WP_CONTENT_DIR).'upgrade';
+  if(!is_dir($upgrade)) return false;
+
+  foreach (glob($upgrade.'/*', GLOB_ONLYDIR) as $cand){
+    // if extracted folder is named like slug OR contains a child dir named slug
+    if ( basename($cand) === $slug || is_dir(trailingslashit($cand).$slug) ) {
+      $res = nh_rescue_plugin_from_source($cand);
+      return !is_wp_error($res);
+    }
+  }
+  return false;
+}
+
+/** Auto-rescue when copy/rename fails during updates */
+add_filter('upgrader_install_package_result', function($result, $hook_extra){
+  if ( isset($hook_extra['type']) && $hook_extra['type']==='plugin' && is_wp_error($result) ) {
+    $slug = isset($hook_extra['plugin']) ? dirname($hook_extra['plugin']) : '';
+    if($slug && nh_rescue_plugin_if_stuck($slug)) {
+      return ['rescued'=>true,'slug'=>$slug,'from'=>'upgrade'];
+    }
+  }
+  return $result;
+}, 10, 2);
+
+/** REST sanity ping to confirm this file is loaded */
+add_action('rest_api_init', function(){
+  register_rest_route('custom/v1','/rescue-ping',[
+    'methods'=>'GET',
+    'permission_callback'=>'__return_true',
+    'callback'=>fn()=> new WP_REST_Response(['ok'=>true,'rescue_loaded'=>true],200),
+  ]);
+});
+
+/** REST: batch repair anything currently sitting in wp-content/upgrade */
+add_action('rest_api_init', function(){
+  register_rest_route('custom/v1','/repair-plugins',[
+    'methods'=>'POST',
+    'permission_callback'=>function(){ return current_user_can('update_plugins'); },
+    'callback'=>function(){
+      $upgrade = trailingslashit(WP_CONTENT_DIR).'upgrade';
+      $rescued=[];
+      if(is_dir($upgrade)){
+        foreach (glob($upgrade.'/*', GLOB_ONLYDIR) as $cand){
+          $res = nh_rescue_plugin_from_source($cand);
+          if(!is_wp_error($res)) $rescued[]=$res;
+        }
+      }
+      return new WP_REST_Response(['ok'=>true,'rescued'=>$rescued],200);
+    }
+  ]);
+});
+
+/* =========================================================
    STATUS: site/v1/status
-   =========================== */
+   ========================================================= */
 add_action('rest_api_init', function () {
   register_rest_route('site/v1', '/status', [
     'methods'             => 'GET',
@@ -70,8 +163,8 @@ add_action('rest_api_init', function () {
           : $plugin_data['Version'];
 
         $plugin_info[] = [
-          'plugin_file'      => $plugin_file, // e.g. 'akismet/akismet.php'
-          'slug'             => sanitize_title($plugin_data['Name']),
+          'plugin_file'      => $plugin_file,                 // e.g. 'akismet/akismet.php'
+          'slug'             => dirname($plugin_file),        // real slug (folder name)
           'name'             => $plugin_data['Name'],
           'version'          => $plugin_data['Version'],
           'active'           => in_array($plugin_file, $active_plugins, true),
@@ -97,20 +190,20 @@ add_action('rest_api_init', function () {
         ];
       }
 
-      return [
+      return new WP_REST_Response([
         'core'      => $core_info,
         'php_mysql' => $php_mysql_info,
         'plugins'   => $plugin_info,
         'themes'    => $theme_info,
-      ];
+      ], 200);
     },
   ]);
 });
 
-/* ======================================
+/* =========================================================
    UPDATE PLUGINS: custom/v1/update-plugins
    - Body: {"plugins":["a/b.php","c/d.php"]}  OR  {"plugins":"all"}
-   ====================================== */
+   ========================================================= */
 add_action('rest_api_init', function () {
   register_rest_route('custom/v1', '/update-plugins', [
     'methods'             => 'POST',
@@ -131,6 +224,14 @@ function handle_plugin_update_request( WP_REST_Request $request ) {
 
   // Ensure direct FS writes
   if (!defined('FS_METHOD')) define('FS_METHOD', 'direct');
+
+  // Preflight: plugins dir must be writable
+  if ( ! wp_is_writable( WP_PLUGIN_DIR ) ) {
+    return new WP_REST_Response([
+      'ok' => false,
+      'error' => 'Plugins directory not writable: ' . WP_PLUGIN_DIR
+    ], 500);
+  }
 
   // Includes + filesystem
   require_once ABSPATH . 'wp-admin/includes/plugin.php';
@@ -160,7 +261,7 @@ function handle_plugin_update_request( WP_REST_Request $request ) {
     }
   }
 
-  // NEW: allow {"plugins":"all"} to update everything with an available update
+  // Allow {"plugins":"all"} to update everything with an available update
   if (count($plugins) === 1 && strtolower($plugins[0]) === 'all') {
     wp_update_plugins();                 // refresh transient
     $updates = get_plugin_updates();     // keyed by plugin_file
@@ -174,15 +275,18 @@ function handle_plugin_update_request( WP_REST_Request $request ) {
   // Freshen before upgrades
   wp_update_plugins();
 
-  // Quiet upgrader skin (suppress HTML output)
+  // Quiet upgrader skin that still captures messages
   $skin = new class extends WP_Upgrader_Skin {
+    public array $messages = [];
     public function header() {}
     public function footer() {}
-    public function feedback($string, ...$args) {}
-    public function error($errors) {}
     public function before() {}
     public function after() {}
-    public function get_upgrade_messages() { return $this->messages ?? []; }
+    public function error($e) { $this->messages[] = is_wp_error($e) ? $e->get_error_message() : (string)$e; }
+    public function feedback($string, ...$args) {
+      if (is_string($string)) $this->messages[] = vsprintf($string, (array)$args);
+    }
+    public function get_upgrade_messages() { return $this->messages; }
   };
 
   $upgrader = new Plugin_Upgrader($skin);
@@ -192,9 +296,36 @@ function handle_plugin_update_request( WP_REST_Request $request ) {
     $pf = trim($pf);
     if ($pf === '') continue;
 
+    // run the upgrade
     $res = $upgrader->upgrade($pf);
 
-    if (is_wp_error($res)) {
+    // default outcome
+    $ok = ( $res === true ) || ( is_array($res) && empty($res['error']) );
+
+    // If it failed, try auto-rescue from wp-content/upgrade
+    if ( ! $ok ) {
+      $slug = dirname($pf);
+      if ( function_exists('nh_rescue_plugin_if_stuck') && nh_rescue_plugin_if_stuck($slug) ) {
+        $ok = true;
+      }
+    }
+
+    // Double-check the plugin directory exists post-op
+    $plugin_dir = WP_PLUGIN_DIR . '/' . dirname($pf);
+    if ( $ok && ! is_dir($plugin_dir) ) {
+      // dir still missing? one more rescue try
+      $slug = dirname($pf);
+      if ( function_exists('nh_rescue_plugin_if_stuck') && nh_rescue_plugin_if_stuck($slug) ) {
+        $ok = true;
+      } else {
+        $ok = false;
+      }
+    }
+
+    // Surface messages for debugging
+    $msg = method_exists($upgrader->skin, 'get_upgrade_messages') ? $upgrader->skin->get_upgrade_messages() : null;
+
+    if ( is_wp_error($res) ) {
       $results[] = [
         'plugin' => $pf,
         'ok'     => false,
@@ -203,11 +334,12 @@ function handle_plugin_update_request( WP_REST_Request $request ) {
           'message' => $res->get_error_message(),
           'data'    => $res->get_error_data(),
         ],
+        'messages' => $msg,
       ];
     } else {
-      $ok = ($res === true) || (is_array($res) && empty($res['error']));
       $item = [ 'plugin' => $pf, 'ok' => (bool)$ok ];
-      if (is_array($res)) $item['raw'] = $res; // surface raw result for debugging
+      if ( is_array($res) ) $item['raw'] = $res;
+      if ( $msg ) $item['messages'] = $msg;
       $results[] = $item;
     }
   }
@@ -222,8 +354,9 @@ function handle_plugin_update_request( WP_REST_Request $request ) {
     ];
   }
 
-  // Clear transient so next /status shows fresh
+  // Clear caches so next /status shows fresh
   delete_site_transient('update_plugins');
+  if ( function_exists('wp_clean_plugins_cache') ) wp_clean_plugins_cache(true);
 
   $overall_ok = true;
   foreach ($results as $r) { if (empty($r['ok'])) { $overall_ok = false; break; } }
@@ -235,9 +368,9 @@ function handle_plugin_update_request( WP_REST_Request $request ) {
   ], 200);
 }
 
-/* ==================================
+/* =========================================================
    UPDATE CORE: custom/v1/update-core
-   ================================== */
+   ========================================================= */
 add_action('rest_api_init', function () {
   register_rest_route('custom/v1', '/update-core', [
     'methods'             => 'POST',
@@ -251,6 +384,7 @@ function custom_update_wp_core( WP_REST_Request $request ) {
   @ini_set('max_execution_time', '1200');
   if (function_exists('set_time_limit')) { @set_time_limit(1200); }
   if (!defined('FS_METHOD')) define('FS_METHOD', 'direct');
+  if ( ! defined('WP_TEMP_DIR') ) define('WP_TEMP_DIR', WP_CONTENT_DIR . '/upgrade');
 
   require_once ABSPATH . 'wp-admin/includes/update.php';
   require_once ABSPATH . 'wp-admin/includes/file.php';

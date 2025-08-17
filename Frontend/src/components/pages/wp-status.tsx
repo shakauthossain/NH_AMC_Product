@@ -13,6 +13,8 @@ import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { useToast } from "@/hooks/use-toast";
 import { apiService } from "@/lib/api";
+import { PluginDebugPanel } from "@/components/ui/plugin-debug-panel";
+import type { PluginInfo, NormalizationDebugInfo } from "@/lib/plugin-normalizer";
 import { 
   Shield, 
   RefreshCw, 
@@ -74,6 +76,12 @@ export function WPStatusPage() {
     dbPassword: '',
     domain: ''
   });
+  const [isBulkUpdating, setIsBulkUpdating] = useState(false);
+  const [debugInfo, setDebugInfo] = useState<{
+    normalization?: NormalizationDebugInfo;
+    attempts?: any[];
+    taskResult?: any;
+  }>({});
   const { toast } = useToast();
 
   // Load saved connections
@@ -162,34 +170,34 @@ export function WPStatusPage() {
   const { data: wpOutdatedStatus, refetch: refetchOutdated, isLoading: outdatedLoading } = useQuery({
     queryKey: ['wp-outdated', selectedSite],
     queryFn: async () => {
-      console.log('Starting WP Outdated check...');
-      console.log("selectedSite", selectedSite);
-      console.log("selectedConnection", selectedConnection);
+// console.log('Starting WP Outdated check...');
+      // console.log("selectedSite", selectedSite);
+      // console.log("selectedConnection", selectedConnection);
       if (!selectedSite || !selectedConnection) return null;
       
       const domain = selectedConnection.host
       // ?.includes('.') 
       //   ? selectedConnection.name 
       //   : selectedConnection.host;
-      console.log("domain", domain);
+// console.log("domain", domain);
       // Try to construct a proper WP REST API URL
       const baseUrl = domain.startsWith('http') ? domain : `http://${domain}`;
-      console.log("baseUrl", baseUrl);
+      // console.log("baseUrl", baseUrl);
       const restUrl = `${baseUrl}/wp-json/site/v1/status`;
-      console.log("restUrl", restUrl);
+      // console.log("restUrl", restUrl);
       
       try {
         const outdatedResponse = await apiService.wpOutdatedFetch(restUrl);
-        console.log("outdatedResponse", outdatedResponse);
+// console.log("outdatedResponse", outdatedResponse);
         const result = await apiService.pollTask(outdatedResponse.task_id);
-        console.log("WP Outdated task result:", result);
+        // console.log("WP Outdated task result:", result);
         
         if (result.state === 'SUCCESS' && result.result) {
-          console.log("WP Outdated data structure:", {
-            plugins: result.result.raw.plugins,
-            themes: result.result.raw.themes,
-            core: result.result.raw.core
-          });
+// console.log("WP Outdated data structure:", {
+            // plugins: result.result.raw.plugins,
+            // themes: result.result.raw.themes,
+            // core: result.result.raw.core
+          // });
           return {
             plugins: result.result.raw.plugins || [],
             themes: result.result.raw.themes || [],
@@ -197,7 +205,7 @@ export function WPStatusPage() {
           };
         }
         
-        console.log("WP Outdated task failed or no result:", result);
+        // console.log("WP Outdated task failed or no result:", result);
         return null;
       } catch (error) {
         console.error('WP Outdated check failed:', error);
@@ -209,7 +217,7 @@ export function WPStatusPage() {
     retry: false,
   });
 
-  console.log("Current wpOutdatedStatus:", wpOutdatedStatus);
+  // console.log("Current wpOutdatedStatus:", wpOutdatedStatus);
 
   const handleRefreshAll = () => {
     refetchSSL();
@@ -222,6 +230,13 @@ export function WPStatusPage() {
   };
 
   const openUpdateDialog = (itemName: string, itemType: 'plugin' | 'theme') => {
+    // Skip dialog for plugins - handle directly
+    if (itemType === 'plugin') {
+      handleUpdateItem(itemName, itemType);
+      return;
+    }
+    
+    // Show dialog for themes (themes need database info)
     setSelectedUpdateItem({ name: itemName, type: itemType });
     setUpdateFormData({
       dbName: '',
@@ -232,23 +247,28 @@ export function WPStatusPage() {
     setIsUpdateDialogOpen(true);
   };
 
-  const handleUpdateItem = async () => {
-    if (!selectedConnection || !selectedUpdateItem) return;
-    
-    const { name: itemName, type: itemType } = selectedUpdateItem;
-    const itemKey = `${itemType}-${itemName}`;
-    setUpdatingItems(prev => new Set(prev).add(itemKey));
-    
+  const handleBulkPluginUpdate = async () => {
+    if (!selectedConnection || !wpOutdatedStatus?.plugins) return;
+
+    // Get all plugins that have updates available
+    const outdatedPlugins = wpOutdatedStatus.plugins.filter((plugin: any) => 
+      plugin.updateAvailable || plugin.update_available
+    );
+
+    if (outdatedPlugins.length === 0) {
+      toast({
+        title: "No updates available",
+        description: "All plugins are already up to date.",
+      });
+      return;
+    }
+
+    setIsBulkUpdating(true);
+
     try {
       // Get authentication from settings
       const settings = apiService.getSettings();
       const { username, password } = settings.defaultAuth || {};
-      
-      console.log('=== UPDATE ITEM DEBUG ===');
-      console.log('Settings:', settings);
-      console.log('Auth username:', username);
-      console.log('Auth password:', password ? '[SET]' : '[NOT SET]');
-      console.log('Form data:', updateFormData);
       
       if (!username || !password) {
         toast({
@@ -259,11 +279,99 @@ export function WPStatusPage() {
         return;
       }
 
-      // itemName should already be the plugin slug/path from the button click
-      let itemSlug = itemName;
+      // Construct base URL
+      const baseUrl = selectedConnection.host.startsWith('http') 
+        ? selectedConnection.host 
+        : `http://${selectedConnection.host}`;
 
-      console.log('Original item name:', itemName);
-      console.log('Using item slug/path:', itemSlug);
+      // Get plugin files for bulk update
+      const pluginFiles = outdatedPlugins.map((plugin: any) => plugin.plugin_file);
+
+      console.log('=== BULK PLUGIN UPDATE REQUEST ===');
+      console.log('Plugins to update:', outdatedPlugins.map(p => p.name || p.slug));
+      console.log('Plugin files:', pluginFiles);
+      console.log('Base URL:', baseUrl);
+      console.log('Auth:', { username, password: password ? '[SET]' : '[NOT SET]' });
+
+      // Use the new bulk polling method
+      const bulkResult = await apiService.updateAllPluginsWithPolling(
+        baseUrl,
+        pluginFiles,
+        { username, password },
+        (status) => {
+          toast({
+            title: "Bulk Plugin Update",
+            description: status,
+          });
+        }
+      );
+
+      console.log('=== BULK PLUGIN UPDATE RESULT ===');
+      console.log('Success:', bulkResult.success);
+      console.log('Summary:', bulkResult.summary);
+      console.log('Results:', bulkResult.results);
+
+      // Show summary toast
+      if (bulkResult.success) {
+        toast({
+          title: "Bulk plugin update completed",
+          description: bulkResult.summary,
+        });
+      } else {
+        toast({
+          title: "Bulk plugin update failed",
+          description: bulkResult.summary,
+          variant: "destructive",
+        });
+      }
+
+      // Refresh status
+      refetchOutdated();
+
+    } catch (error) {
+      console.error('Bulk plugin update failed:', error);
+      
+      if (error instanceof Error && error.message.includes('timeout')) {
+        toast({
+          title: "Update timeout",
+          description: "Still running in background; refresh to check status.",
+          variant: "destructive",
+        });
+      } else {
+        toast({
+          title: "Bulk update failed",
+          description: `Failed to update plugins: ${error}`,
+          variant: "destructive",
+        });
+      }
+    } finally {
+      setIsBulkUpdating(false);
+    }
+  };
+
+  const handleUpdateItem = async (itemName?: string, itemType?: 'plugin' | 'theme') => {
+    // Use parameters if provided, otherwise use selected item from dialog
+    const name = itemName || selectedUpdateItem?.name;
+    const type = itemType || selectedUpdateItem?.type;
+    
+    if (!selectedConnection || !name || !type) return;
+    
+    const itemKey = `${type}-${name}`;
+    setUpdatingItems(prev => new Set(prev).add(itemKey));
+    
+    try {
+      // Get authentication from settings
+      const settings = apiService.getSettings();
+      const { username, password } = settings.defaultAuth || {};
+      
+      if (!username || !password) {
+        toast({
+          title: "Authentication required",
+          description: "Please configure WordPress credentials in Settings first.",
+          variant: "destructive",
+        });
+        return;
+      }
 
       // Construct base URL from connection or form data
       let baseUrl = selectedConnection.host.startsWith('http') 
@@ -277,32 +385,93 @@ export function WPStatusPage() {
           : `http://${updateFormData.domain}`;
       }
 
-      console.log('Base URL constructed:', baseUrl);
-
-      // Use the new API service method for plugin updates
-      let result;
       if (itemType === 'plugin') {
-        result = await apiService.updatePlugins(
-          baseUrl,
-          [itemSlug], // Use the plugin slug/path instead of display name
-          false, // Don't auto-select outdated since we're specifying exact plugins
-          [], // Empty blocklist
-          undefined, // No custom headers
-          { username, password }, // Auth
-          undefined // No report email
+        // Find the plugin in the available plugins list to get its plugin_file
+        const targetPlugin = wpOutdatedStatus?.plugins?.find((p: any) => 
+          p.name === itemName || p.slug === itemName
         );
+
+        if (!targetPlugin) {
+          throw new Error(`Plugin "${itemName}" not found in available plugins`);
+        }
+
+        const pluginFile = targetPlugin.plugin_file;
+        
+        console.log('=== PLUGIN UPDATE REQUEST ===');
+        console.log('Plugin to update:', itemName);
+        console.log('Plugin file:', pluginFile);
+        console.log('Base URL:', baseUrl);
+        console.log('Auth:', { username, password: password ? '[SET]' : '[NOT SET]' });
+
+        // Use the new polling method for proper verification
+        const updateResult = await apiService.updatePluginWithPolling(
+          baseUrl,
+          pluginFile,
+          { username, password },
+          (status) => {
+            // Update toast to show progress
+            toast({
+              title: "Plugin Update",
+              description: status,
+            });
+          }
+        );
+
+        console.log('=== PLUGIN UPDATE RESULT ===');
+        console.log('Success:', updateResult.success);
+        console.log('Updated:', updateResult.updated);
+        console.log('Message:', updateResult.message);
+        console.log('Details:', updateResult.details);
+
+        // Show result toast
+        if (updateResult.success && updateResult.updated) {
+          toast({
+            title: "Plugin updated",
+            description: `${itemName} is now up to date.`,
+          });
+        } else if (updateResult.success && !updateResult.updated) {
+          toast({
+            title: "Plugin update failed",
+            description: `${itemName} did not update. ${updateResult.details || ''}`,
+            variant: "destructive",
+          });
+        } else {
+          // Handle auth failures specifically
+          if (updateResult.details?.includes('401') || updateResult.details?.toLowerCase().includes('auth')) {
+            toast({
+              title: "Auth failed on WordPress",
+              description: "Check username/password in Settings.",
+              variant: "destructive",
+            });
+          } else {
+            toast({
+              title: "Plugin update failed",
+              description: updateResult.details || updateResult.message,
+              variant: "destructive",
+            });
+          }
+        }
+
+        // Close dialog if it was open and refresh status
+        setIsUpdateDialogOpen(false);
+        refetchOutdated();
+
       } else {
-        // For themes, we'll use the generic endpoint approach since there's no specific theme update method
+        // For themes, use the standard method (themes don't have the same complexity)
         const endpoint = '/tasks/wp-update/themes';
         const fullUrl = `${settings.baseUrl}${endpoint}`;
         
         const payload = {
           base_url: baseUrl,
-          themes: [itemSlug],
-          auth: { username, password }
+          themes: [itemName],
+          auth: { username, password },
         };
 
-        console.log('Theme update payload:', payload);
+        console.log('=== THEME UPDATE REQUEST ===');
+        console.log('Theme to update:', itemName);
+        console.log('Base URL:', baseUrl);
+        console.log('Auth:', { username, password: password ? '[SET]' : '[NOT SET]' });
+        console.log('Payload:', payload);
         
         const response = await fetch(fullUrl, {
           method: 'POST',
@@ -317,28 +486,40 @@ export function WPStatusPage() {
           const errorData = await response.json();
           throw new Error(errorData.error || `HTTP error! status: ${response.status}`);
         }
-        
-        result = await response.json();
-      }
 
-      console.log('Update response:', result);
-      
-      toast({
-        title: `${itemType} update queued`,
-        description: `Task ID: ${result.task_id}`,
-      });
-      
-      // Close dialog and refresh
-      setIsUpdateDialogOpen(false);
-      refetchOutdated();
+        const result = await response.json();
+        console.log('=== THEME UPDATE RESPONSE ===');
+        console.log('Task ID:', result.task_id);
+        console.log('Status:', result.status);
+        console.log('Full response:', result);
+
+        // For now, just show success for themes (can be enhanced later)
+        toast({
+          title: "Theme update queued",
+          description: `Task ID: ${result.task_id}`,
+        });
+        
+        // Close dialog and refresh status
+        setIsUpdateDialogOpen(false);
+        refetchOutdated();
+      }
       
     } catch (error) {
       console.error(`Failed to update ${itemType}:`, error);
-      toast({
-        title: `Update failed`,
-        description: `Failed to update ${itemName}. Please try again.`,
-        variant: "destructive",
-      });
+      
+      if (error instanceof Error && error.message.includes('timeout')) {
+        toast({
+          title: "Update timeout",
+          description: "Still running in background; refresh to check status.",
+          variant: "destructive",
+        });
+      } else {
+        toast({
+          title: "Update failed",
+          description: `Failed to update ${itemName}: ${error}`,
+          variant: "destructive",
+        });
+      }
     } finally {
       setUpdatingItems(prev => {
         const newSet = new Set(prev);
@@ -597,8 +778,26 @@ export function WPStatusPage() {
               <CardContent>
                 <Tabs defaultValue="plugins" className="space-y-4">
                   <TabsList>
-                    <TabsTrigger value="plugins">Plugins</TabsTrigger>
+                   <TabsTrigger value="plugins">Plugins</TabsTrigger>
                     <TabsTrigger value="themes">Themes</TabsTrigger>
+                  </TabsList>
+                  <div className="flex justify-end mb-4">
+                    <Button
+                      onClick={handleBulkPluginUpdate}
+                      disabled={isBulkUpdating || !wpOutdatedStatus?.plugins?.some((p: any) => p.updateAvailable || p.update_available)}
+                      className="h-9"
+                    >
+                      {isBulkUpdating ? (
+                        <>
+                          <RefreshCw className="w-4 h-4 mr-2 animate-spin" />
+                          Updating All...
+                        </>
+                      ) : (
+                        'Update All Plugins'
+                      )}
+                    </Button>
+                  </div>
+                  <TabsList className="hidden">
                   </TabsList>
 
                   <TabsContent value="plugins">
@@ -643,8 +842,8 @@ export function WPStatusPage() {
                                   <Button
                                     size="sm"
                                     variant="outline"
-                                    onClick={() => openUpdateDialog(plugin.name, 'plugin')}
-                                    disabled={isUpdating}
+                                    onClick={() => openUpdateDialog(plugin.name || plugin.slug, 'plugin')}
+                                    disabled={isUpdating || isBulkUpdating}
                                     className="h-8"
                                   >
                                    {isUpdating ? (
@@ -709,13 +908,13 @@ export function WPStatusPage() {
                              </div>
                              <div>
                                {hasUpdate && (
-                                  <Button
-                                    size="sm"
-                                    variant="outline"
-                                    onClick={() => openUpdateDialog(theme.name, 'theme')}
-                                    disabled={isUpdating}
-                                    className="h-8"
-                                  >
+                                 <Button
+                                   size="sm"
+                                   variant="outline"
+                                   onClick={() => openUpdateDialog(theme.name || theme.slug, 'theme')}
+                                   disabled={isUpdating}
+                                   className="h-8"
+                                 >
                                    {isUpdating ? (
                                      <>
                                        <RefreshCw className="w-3 h-3 mr-1 animate-spin" />
@@ -743,6 +942,15 @@ export function WPStatusPage() {
             </Card>
           )}
         </motion.div>
+      )}
+
+      {/* Plugin Debug Panel */}
+      {(debugInfo.normalization || debugInfo.attempts || debugInfo.taskResult) && (
+        <PluginDebugPanel
+          debugInfo={debugInfo.normalization}
+          attempts={debugInfo.attempts}
+          taskResult={debugInfo.taskResult}
+        />
       )}
 
       {/* Update Dialog */}
@@ -799,7 +1007,7 @@ export function WPStatusPage() {
                 Cancel
               </Button>
               <Button
-                onClick={handleUpdateItem}
+                onClick={() => handleUpdateItem()}
                 disabled={!updateFormData.dbName || !updateFormData.dbUser || !updateFormData.dbPassword}
               >
                 Start Update
