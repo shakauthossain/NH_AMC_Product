@@ -178,6 +178,24 @@ def wp_update_plugins_task(self,
     
     log.info(f"[task {self.request.id}] normalize: {selected_before} -> {selected}")
 
+    try:
+        plugin_result = (
+            out.get("plugins", {})
+            .get("result", {})
+            .get("result", {})
+            .get("results", {})
+        )
+        failures = {k: v for k, v in plugin_result.items() if not v.get("ok")}
+        successes = [k for k, v in plugin_result.items() if v.get("ok")]
+
+        if successes:
+            log.info(f"[task {self.request.id}] ✅ Plugin(s) updated: {successes}")
+        if failures:
+            log.warning(f"[task {self.request.id}] ❌ Plugin(s) failed: {failures}")
+    except Exception as e:
+        log.warning(f"[task {self.request.id}] ⚠️ Failed to parse plugin result details: {e}")
+
+
     if report_email:
         try:
             send_report_email(report_email, f"[{settings.APP_NAME}] WP plugin updates for {base_url}", out or {})
