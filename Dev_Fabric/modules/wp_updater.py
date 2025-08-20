@@ -109,11 +109,11 @@ def update_plugins(
 ) -> Dict[str, Any]:
     """
     Update one or more plugins with multiple fallbacks:
-      1) Batch JSON body:  {"plugins": ["a/b.php","c/d.php"]}
-      2) Batch form body:  plugins="a/b.php,c/d.php"
-      3) One-by-one (JSON, then form) for any that still fail
+      1) Batch form body first:  plugins="a/b.php,c/d.php"&mode=bulk|single
+      2) Batch JSON body:        {"plugins": [...], "mode": ...}
+      3) One-by-one (form then JSON) for any that still fail
 
-    Also verifies post-update status to confirm actual version bumps.
+    Also verifies post-update status to confirm version bumps or up_to_date.
     """
     if not plugins:
         return {"ok": False, "error": "No plugins provided"}
@@ -128,48 +128,50 @@ def update_plugins(
         return {"ok": False, "url": base_url, "error": f"Status (before) fetch failed: {e}"}
     before_map = _plugin_versions_map(before)
 
-    def _post_json(plugs: List[str]) -> requests.Response:
-        hdrs = {"Content-Type": "application/json"}
-        merged = {**(headers or {}), **hdrs}
-        return requests.post(
-            u_plugins,
-            json={"plugins": plugs},
-            **_auth_or_headers(auth, merged, timeout=timeout_per_call)
-        )
+    # Decide mode explicitly (optional but helpful)
+    mode = "single" if len(plugins) == 1 else "bulk"
 
     def _post_form(plugs: List[str]) -> requests.Response:
         hdrs = {"Content-Type": "application/x-www-form-urlencoded"}
         merged = {**(headers or {}), **hdrs}
         return requests.post(
             u_plugins,
-            data={"plugins": ",".join(plugs)},
+            data={"plugins": ",".join(plugs), "mode": mode},
             **_auth_or_headers(auth, merged, timeout=timeout_per_call)
         )
 
-    attempts: List[Dict[str, Any]] = []   # record of batch attempts
-    per_plugin: List[Dict[str, Any]] = [] # record of granular attempts
+    def _post_json(plugs: List[str]) -> requests.Response:
+        hdrs = {"Content-Type": "application/json"}
+        merged = {**(headers or {}), **hdrs}
+        return requests.post(
+            u_plugins,
+            json={"plugins": plugs, "mode": mode},
+            **_auth_or_headers(auth, merged, timeout=timeout_per_call)
+        )
 
-    # 1) Try batch JSON
+    attempts: List[Dict[str, Any]] = []
+    per_plugin: List[Dict[str, Any]] = []
     last_ok = False
+
+    # 1) Try batch FORM first (best match for your PHP)
     try:
-        r = _post_json(plugins)
-        attempts.append({"mode": "batch_json", "status": r.status_code, "ok": r.ok, "body": (r.text or "")[:800]})
+        r = _post_form(plugins)
+        attempts.append({"mode": "batch_form", "status": r.status_code, "ok": r.ok, "body": (r.text or "")[:800]})
         last_ok = r.ok
     except Exception as e:
-        attempts.append({"mode": "batch_json_exc", "error": str(e)})
+        attempts.append({"mode": "batch_form_exc", "error": str(e)})
         last_ok = False
 
-    # 2) If batch JSON failed, try batch form
+    # 2) If form failed, try batch JSON
     if not last_ok:
         try:
-            r = _post_form(plugins)
-            attempts.append({"mode": "batch_form", "status": r.status_code, "ok": r.ok, "body": (r.text or "")[:800]})
+            r = _post_json(plugins)
+            attempts.append({"mode": "batch_json", "status": r.status_code, "ok": r.ok, "body": (r.text or "")[:800]})
             last_ok = r.ok
         except Exception as e:
-            attempts.append({"mode": "batch_form_exc", "error": str(e)})
+            attempts.append({"mode": "batch_json_exc", "error": str(e)})
             last_ok = False
 
-    # Let WP settle a moment (zip download/unpack can be async-ish depending on server)
     time.sleep(settle_secs)
 
     # Check which plugins still look stale after batch
@@ -180,50 +182,47 @@ def update_plugins(
         after_batch = None
         after_batch_map = {}
 
+    def _is_up_to_date(pf: str) -> bool:
+        """Consider success if version didn't change but after.current == after.latest."""
+        return _looks_updated(before_map, after_batch_map, pf)
+
     needs_fix = []
     if after_batch_map:
         for pf in plugins:
-            if not _looks_updated(before_map, after_batch_map, pf):
+            if not _is_up_to_date(pf):
                 needs_fix.append(pf)
     else:
-        # If we couldn't fetch after-batch, assume we need to retry all (conservative)
         needs_fix = list(plugins)
 
-    # 3) One-by-one fallback (only for ones that didn't move)
+    # 3) One-by-one fallback (only those that didn't move)
     if needs_fix:
         for pf in needs_fix:
-            # Per-plugin JSON
-            ok_json = None
-            ok_form = None
-            status_json = None
-            status_form = None
-            body_json = None
-            body_form = None
+            ok_form = ok_json = None
+            status_form = status_json = None
+            body_form = body_json = None
 
             try:
-                rj = _post_json([pf])
-                ok_json = rj.ok
-                status_json = rj.status_code
-                body_json = (rj.text or "")[:800]
+                rf = _post_form([pf])
+                ok_form = rf.ok
+                status_form = rf.status_code
+                body_form = (rf.text or "")[:800]
             except Exception as e:
-                ok_json = False
-                status_json = None
-                body_json = f"exception: {e}"
+                ok_form = False
+                status_form = None
+                body_form = f"exception: {e}"
 
-            if not ok_json:
+            if not ok_form:
                 try:
-                    rf = _post_form([pf])
-                    ok_form = rf.ok
-                    status_form = rf.status_code
-                    body_form = (rf.text or "")[:800]
+                    rj = _post_json([pf])
+                    ok_json = rj.ok
+                    status_json = rj.status_code
+                    body_json = (rj.text or "")[:800]
                 except Exception as e:
-                    ok_form = False
-                    status_form = None
-                    body_form = f"exception: {e}"
+                    ok_json = False
+                    status_json = None
+                    body_json = f"exception: {e}"
 
-            # Verify post-plugin
             time.sleep(settle_secs)
-            updated = False
             try:
                 post = fetch_status(base_url, auth, headers, timeout=30)
                 post_map = _plugin_versions_map(post)
@@ -233,32 +232,27 @@ def update_plugins(
 
             per_plugin.append({
                 "plugin_file": pf,
+                "form": {"ok": ok_form, "status": status_form, "body": body_form},
                 "json": {"ok": ok_json, "status": status_json, "body": body_json},
-                "form": {"ok": ok_form, "status": status_form, "body": body_form} if ok_form is not None else None,
-                "updated": updated
+                "updated": updated,
             })
 
-    # Final verification: if we never did per_plugin, rely on after_batch map
-    overall_updated = True
+    # Final verdict
     if per_plugin:
         overall_updated = all(x.get("updated") for x in per_plugin)
     else:
-        # If batch seemed OK, ensure all look updated in after_batch_map
-        if not after_batch_map:
-            overall_updated = False
-        else:
-            overall_updated = all(_looks_updated(before_map, after_batch_map, pf) for pf in plugins)
+        overall_updated = bool(after_batch_map) and all(_looks_updated(before_map, after_batch_map, pf) for pf in plugins)
 
     result: Dict[str, Any] = {
         "ok": bool(overall_updated),
         "url": u_plugins,
         "request_plugins": plugins,
+        "mode": mode,
         "result": {
             "batch": attempts,
             "per_plugin": per_plugin,
         }
     }
-    # Optional: include a concise diff for the UI
     if after_batch:
         result["post_status"] = after_batch
 

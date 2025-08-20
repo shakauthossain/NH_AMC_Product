@@ -1,269 +1,467 @@
 <?php
+/**
+ * Plugin Name: Site Update Endpoints
+ * Description: REST endpoints to fetch update status and to update plugins, themes, and core (single vs bulk).
+ * Version:     1.0.0
+ * Author:      Your Name
+ */
+
+if ( ! defined( 'ABSPATH' ) ) exit;
+
+// --- Common Includes (load early) ---
+require_once ABSPATH . 'wp-admin/includes/plugin.php';
+require_once ABSPATH . 'wp-admin/includes/theme.php';
+require_once ABSPATH . 'wp-admin/includes/update.php';
+require_once ABSPATH . 'wp-admin/includes/file.php';
+require_once ABSPATH . 'wp-admin/includes/class-wp-upgrader.php';
+
+//
+// -------- Silent Skins (no HTML output) --------
+//
+
+class SUE_Silent_Single_Skin extends WP_Upgrader_Skin {
+	public array $messages = [];
+	public function header() {}
+	public function footer() {}
+	public function before() {}
+	public function after() {}
+	public function feedback( $string, ...$args ) {
+		if ( is_string( $string ) ) $this->messages[] = vsprintf( $string, (array) $args );
+	}
+	public function error( $errors ) {
+		$this->messages[] = is_wp_error( $errors ) ? $errors->get_error_message() : (string) $errors;
+	}
+	public function get_messages() { return $this->messages; }
+}
+
+class SUE_Silent_Bulk_Plugin_Skin extends Bulk_Plugin_Upgrader_Skin {
+	public array $messages = [];
+	public function header() {}
+	public function footer() {}
+	public function feedback( $string, ...$args ) {
+		if ( is_string( $string ) ) $this->messages[] = vsprintf( $string, (array) $args );
+	}
+	public function error( $errors ) {
+		$this->messages[] = is_wp_error( $errors ) ? $errors->get_error_message() : (string) $errors;
+	}
+	public function get_messages() { return $this->messages; }
+}
+
+class SUE_Silent_Bulk_Theme_Skin extends Bulk_Theme_Upgrader_Skin {
+	public array $messages = [];
+	public function header() {}
+	public function footer() {}
+	public function feedback( $string, ...$args ) {
+		if ( is_string( $string ) ) $this->messages[] = vsprintf( $string, (array) $args );
+	}
+	public function error( $errors ) {
+		$this->messages[] = is_wp_error( $errors ) ? $errors->get_error_message() : (string) $errors;
+	}
+	public function get_messages() { return $this->messages; }
+}
+
+class SUE_Silent_Core_Skin extends WP_Upgrader_Skin {
+	public array $messages = [];
+	public function header() {}
+	public function footer() {}
+	public function feedback( $string, ...$args ) {}
+	public function error( $errors ) {
+		$this->messages[] = is_wp_error( $errors ) ? $errors->get_error_message() : (string) $errors;
+	}
+	public function get_messages() { return $this->messages; }
+}
+
+//
+// -------- Helpers --------
+//
 
 /**
+ * Ensure filesystem is ready and use 'direct' where safe.
+ */
+function sue_prepare_filesystem() {
+	if ( ! defined( 'FS_METHOD' ) ) {
+		define( 'FS_METHOD', 'direct' );
+	}
+	global $wp_filesystem;
+	if ( empty( $wp_filesystem ) ) {
+		WP_Filesystem();
+	}
+}
 
-This one is the main functions.php of the activated theme.
+/**
+ * Normalize truthy check for upgrader results.
+ *
+ * @param mixed $res
+ * @return bool
+ */
+function sue_result_ok( $res ) {
+	// WP can return true, null (already latest), or an array without 'error'
+	if ( $res === true || $res === null ) return true;
+	if ( is_array( $res ) && empty( $res['error'] ) ) return true;
+	return ! is_wp_error( $res ) && (bool) $res;
+}
 
- **/
+//
+// -------- STATUS: GET /wp-json/site/v1/status --------
+//
 
-//Fetching Outdate Informations
-add_action('rest_api_init', function () {
-	register_rest_route('site/v1', '/status', [
-		'methods' => 'GET',
-		'callback' => function () {
-			require_once ABSPATH . 'wp-admin/includes/plugin.php';
-			require_once ABSPATH . 'wp-admin/includes/theme.php';
-			require_once ABSPATH . 'wp-admin/includes/update.php';
+add_action( 'rest_api_init', function () {
+	register_rest_route( 'site/v1', '/status', [
+		'methods'             => 'GET',
+		'permission_callback' => '__return_true',
+		'callback'            => function () {
 			require_once ABSPATH . 'wp-includes/version.php';
 
-			// Trigger updates
+			// Trigger update checks so transients are fresh.
 			wp_version_check();
 			wp_update_plugins();
 			wp_update_themes();
 
 			// Core info
-			$core_updates = get_site_transient('update_core');
+			$core_updates = get_site_transient( 'update_core' );
 			$core_info = [
-				'current_version' => $GLOBALS['wp_version'],
-				'update_available' => false,
-				'latest_version' => null
+				'current_version'   => $GLOBALS['wp_version'],
+				'update_available'  => false,
+				'latest_version'    => null,
 			];
-			if (!empty($core_updates->updates[0]) && $core_updates->updates[0]->response !== 'latest') {
+			if ( ! empty( $core_updates->updates[0] ) && $core_updates->updates[0]->response !== 'latest' ) {
 				$core_info['update_available'] = true;
-				$core_info['latest_version'] = $core_updates->updates[0]->version;
+				$core_info['latest_version']   = $core_updates->updates[0]->version;
 			}
 
 			// PHP & MySQL
 			global $wpdb;
 			$php_mysql_info = [
-				'php_version' => phpversion(),
-				'mysql_version' => $wpdb->db_version()
+				'php_version'   => phpversion(),
+				'mysql_version' => $wpdb->db_version(),
 			];
 
 			// Plugins
-			$all_plugins = get_plugins();
-			$active_plugins = get_option('active_plugins', []);
-			$plugin_updates = get_plugin_updates();
-			$plugin_info = [];
+			$all_plugins    = get_plugins();                // [plugin_file => data]
+			$active_plugins = get_option( 'active_plugins', [] );
+			$plugin_updates = get_plugin_updates();         // [plugin_file => (obj with ->update->new_version)]
+			$plugin_info    = [];
 
-			foreach ($all_plugins as $plugin_file => $plugin_data) {
-				$update = $plugin_updates[$plugin_file] ?? null;
+			foreach ( $all_plugins as $plugin_file => $plugin_data ) {
+				$update = $plugin_updates[ $plugin_file ] ?? null;
 
 				$plugin_info[] = [
-					'plugin_file'     => $plugin_file,                 // e.g. 'akismet/akismet.php'
-					'slug'            => sanitize_title($plugin_data['Name']), // optional string-safe slug
-					'name'            => $plugin_data['Name'],
-					'version'         => $plugin_data['Version'],
-					'active'          => in_array($plugin_file, $active_plugins),
+					'plugin_file'      => $plugin_file, // e.g. akismet/akismet.php
+					'slug'             => sanitize_title( $plugin_data['Name'] ),
+					'name'             => $plugin_data['Name'],
+					'version'          => $plugin_data['Version'],
+					'active'           => in_array( $plugin_file, $active_plugins, true ),
 					'update_available' => (bool) $update,
-					'latest_version'  => $update->update->new_version ?? $plugin_data['Version'],
+					'latest_version'   => $update->update->new_version ?? $plugin_data['Version'],
 				];
 			}
 
-
 			// Themes
-			$themes = wp_get_themes();
-			$active_theme = wp_get_theme();
-			$theme_updates = get_theme_updates();
-			$theme_info = [];
-			foreach ($themes as $slug => $theme) {
-				$update = $theme_updates[$slug] ?? null;
+			$themes         = wp_get_themes();             // [stylesheet => WP_Theme]
+			$active_theme   = wp_get_theme();
+			$theme_updates  = get_theme_updates();         // [stylesheet => (obj->update->new_version)]
+			$theme_info     = [];
+
+			foreach ( $themes as $stylesheet => $theme ) {
+				$update = $theme_updates[ $stylesheet ] ?? null;
 				$theme_info[] = [
-					'name' => $theme->get('Name'),
-					'version' => $theme->get('Version'),
-					'active' => $theme->get_stylesheet() === $active_theme->get_stylesheet(),
-					'update_available' => $update ? true : false,
-					'latest_version' => $update->update->new_version ?? null
+					'stylesheet'       => $stylesheet,
+					'name'             => $theme->get( 'Name' ),
+					'version'          => $theme->get( 'Version' ),
+					'active'           => ( $theme->get_stylesheet() === $active_theme->get_stylesheet() ),
+					'update_available' => (bool) $update,
+					'latest_version'   => $update->update->new_version ?? null,
 				];
 			}
 
 			return [
-				'core' => $core_info,
+				'core'      => $core_info,
 				'php_mysql' => $php_mysql_info,
-				'plugins' => $plugin_info,
-				'themes' => $theme_info
+				'plugins'   => $plugin_info,
+				'themes'    => $theme_info,
 			];
 		},
-		'permission_callback' => '__return_true',
-	]);
-});
+	] );
+} );
 
-// Custom REST API to update core, plugins, and themes
-// Custom REST API to update core, plugins, and themes
-add_action('rest_api_init', function () {
-	register_rest_route('custom/v1', '/update-plugins', [
-		'methods' => 'POST',
-		'callback' => 'handle_plugin_update_request',
+//
+// -------- PLUGINS: POST /wp-json/custom/v1/update-plugins --------
+//
+
+add_action( 'rest_api_init', function () {
+	register_rest_route( 'custom/v1', '/update-plugins', [
+		'methods'             => 'POST',
 		'permission_callback' => function () {
-			return current_user_can('update_plugins');
+			return current_user_can( 'update_plugins' );
 		},
-	]);
-});
+		'callback'            => 'sue_handle_update_plugins',
+		'args'                => [
+			'plugins' => [ 'required' => false ],
+			'mode'    => [ 'required' => false ], // auto|single|bulk
+		],
+	] );
+} );
 
-// ✅ ADD THIS LINE — ensures WP_Upgrader_Skin is defined early
-require_once ABSPATH . 'wp-admin/includes/class-wp-upgrader.php';
+function sue_handle_update_plugins( WP_REST_Request $request ) {
+	sue_prepare_filesystem();
 
-// Safe skin: disables all output that would normally be used in wp-admin
-class Silent_Skin extends WP_Upgrader_Skin
-{
-	public function header() {}
-	public function footer() {}
-	public function feedback($string, ...$args) {}
-	public function error($errors) {}
-	public function before() {}
-	public function after() {}
-}
-
-function handle_plugin_update_request(WP_REST_Request $request)
-{
-	require_once ABSPATH . 'wp-admin/includes/plugin.php';
-	require_once ABSPATH . 'wp-admin/includes/class-wp-upgrader.php';
-	require_once ABSPATH . 'wp-admin/includes/file.php';
-
-	// Prefer direct FS + make sure FS is ready
-	if (! defined('FS_METHOD')) define('FS_METHOD', 'direct');
-	WP_Filesystem();
-
-	// Refresh update info
+	// Refresh available plugin updates
 	wp_update_plugins();
 
-	// Parse input
-	$param = trim((string)$request->get_param('plugins'));
-	$targets = [];
+	$param_plugins = trim( (string) $request->get_param( 'plugins' ) );
+	$mode          = strtolower( (string) ( $request->get_param( 'mode' ) ?: 'auto' ) );
 
-	if ($param === '' || strtolower($param) === 'all') {
-		// Only those with updates available
-		$updates = get_plugin_updates();          // keyed by plugin_file
-		$targets = array_keys($updates);
-	} elseif (strtolower($param) === 'all-installed') {
-		// Every installed plugin (even if already latest)
-		$all = array_keys(get_plugins());
-		$targets = $all;
+	// Build target list of plugin basenames
+	$targets = [];
+	if ( $param_plugins === '' || $param_plugins === 'all' ) {
+		$updates = get_plugin_updates(); // only those with updates
+		$targets = array_keys( $updates );
+	} elseif ( $param_plugins === 'all-installed' ) {
+		$targets = array_keys( get_plugins() );
 	} else {
-		// CSV list of plugin_file values
-		$list = array_filter(array_map('trim', explode(',', $param)));
-		// Whitelist against installed plugins
-		$installed = array_keys(get_plugins());
-		$targets = array_values(array_intersect($list, $installed));
+		$list      = array_filter( array_map( 'trim', explode( ',', $param_plugins ) ) );
+		$installed = array_keys( get_plugins() );
+		$targets   = array_values( array_intersect( $list, $installed ) );
 	}
 
-	if (empty($targets)) {
-		return new WP_REST_Response([
-			'ok' => true,
+	if ( empty( $targets ) ) {
+		return new WP_REST_Response( [
+			'ok'      => true,
 			'message' => 'No plugins to update',
 			'results' => [],
-		], 200);
+		], 200 );
 	}
 
-	// Quiet skin that suppresses output
-	$skin = new class extends WP_Upgrader_Skin {
-		public array $messages = [];
-		public function header() {}
-		public function footer() {}
-		public function before() {}
-		public function after() {}
-		public function error($e)
-		{
-			$this->messages[] = is_wp_error($e) ? $e->get_error_message() : (string)$e;
-		}
-		public function feedback($s, ...$a)
-		{
-			if (is_string($s)) $this->messages[] = vsprintf($s, (array)$a);
-		}
-		public function get_messages()
-		{
-			return $this->messages;
-		}
-	};
+	if ( $mode === 'auto' ) {
+		$mode = ( count( $targets ) > 1 ) ? 'bulk' : 'single';
+	}
 
-	$upgrader = new Plugin_Upgrader($skin);
-	$results  = [];
-	$overall_ok = true;
+	$overall_ok       = true;
+	$response_results = [];
 
-	foreach ($targets as $plugin_file) {
-		$res = $upgrader->upgrade($plugin_file); // bool|array|WP_Error
-		$ok  = ($res === true) || (is_array($res) && empty($res['error'])) || ($res === null); // WP may return null if already latest
-		if (!$ok) $overall_ok = false;
+	if ( $mode === 'single' ) {
+		$plugin_file = $targets[0];
+		$skin        = new SUE_Silent_Single_Skin();
+		$upgrader    = new Plugin_Upgrader( $skin );
 
-		$results[$plugin_file] = [
+		$res = $upgrader->upgrade( $plugin_file ); // bool|array|WP_Error|null
+		$ok  = sue_result_ok( $res );
+		if ( ! $ok ) $overall_ok = false;
+
+		$response_results[ $plugin_file ] = [
 			'ok'       => $ok,
-			'raw'      => is_wp_error($res) ? $res->get_error_message() : (is_array($res) ? $res : (bool)$res),
-			'messages' => method_exists($upgrader->skin, 'get_messages') ? $upgrader->skin->get_messages() : null,
+			'raw'      => is_wp_error( $res ) ? $res->get_error_message() : ( is_array( $res ) ? $res : (bool) $res ),
+			'messages' => method_exists( $skin, 'get_messages' ) ? $skin->get_messages() : null,
 		];
+	} else {
+		// BULK – mirrors wp-admin’s "Update Selected"
+		$skin     = new SUE_Silent_Bulk_Plugin_Skin( [ 'nonce' => 'bulk-update-plugins' ] );
+		$upgrader = new Plugin_Upgrader( $skin );
+
+		$results = $upgrader->bulk_upgrade( $targets ); // array keyed by plugin_file
+
+		foreach ( $targets as $plugin_file ) {
+			$res = $results[ $plugin_file ] ?? null;
+			$ok  = sue_result_ok( $res );
+			if ( ! $ok ) $overall_ok = false;
+
+			$response_results[ $plugin_file ] = [
+				'ok'  => $ok,
+				'raw' => is_wp_error( $res ) ? $res->get_error_message() : ( is_array( $res ) ? $res : (bool) $res ),
+			];
+		}
+
+		if ( method_exists( $skin, 'get_messages' ) ) {
+			$response_results['_messages'] = $skin->get_messages();
+		}
 	}
 
-	// Clean caches so wp-admin shows fresh state
-	delete_site_transient('update_plugins');
-	if (function_exists('wp_clean_plugins_cache')) wp_clean_plugins_cache(true);
+	// Clean caches
+	delete_site_transient( 'update_plugins' );
+	if ( function_exists( 'wp_clean_plugins_cache' ) ) wp_clean_plugins_cache( true );
 
-	return new WP_REST_Response([
+	return new WP_REST_Response( [
 		'ok'      => $overall_ok,
-		'updated' => array_keys($results),
-		'results' => $results,
-	], 200);
+		'mode'    => $mode,
+		'updated' => array_keys( array_filter( $response_results, fn( $r ) => ! isset( $r['ok'] ) || $r['ok'] ) ),
+		'results' => $response_results,
+	], 200 );
 }
 
+//
+// -------- CORE: POST /wp-json/custom/v1/update-core --------
+//
 
-add_action('rest_api_init', function () {
-	register_rest_route('custom/v1', '/update-core', [
-		'methods'  => 'POST',
-		'callback' => 'custom_update_wp_core',
+add_action( 'rest_api_init', function () {
+	register_rest_route( 'custom/v1', '/update-core', [
+		'methods'             => 'POST',
 		'permission_callback' => function () {
-			return current_user_can('update_core');
+			return current_user_can( 'update_core' );
 		},
-	]);
-});
+		'callback'            => 'sue_handle_update_core',
+	] );
+} );
 
-function custom_update_wp_core(WP_REST_Request $request)
-{
-	require_once ABSPATH . 'wp-admin/includes/update.php';
-	require_once ABSPATH . 'wp-admin/includes/file.php';
-	require_once ABSPATH . 'wp-admin/includes/class-wp-upgrader.php';
+function sue_handle_update_core( WP_REST_Request $request ) {
+	sue_prepare_filesystem();
 
-	// Silent skin definition
-	if (!class_exists('Silent_Upgrader_Skin')) {
-		class Silent_Upgrader_Skin extends WP_Upgrader_Skin
-		{
-			public function header() {}
-			public function footer() {}
-			public function feedback($string, ...$args) {}
-			public function error($errors) {}
-			public function before() {}
-			public function after() {}
-		}
-	}
+	// Clear any stale core lock
+	delete_option( 'core_updater.lock' );
 
-	// Set FS_METHOD to direct
-	if (!defined('FS_METHOD')) {
-		define('FS_METHOD', 'direct');
-	}
-
-	global $wp_filesystem;
-	if (empty($wp_filesystem)) {
-		WP_Filesystem();
-	}
-
-	// Optional: Remove any stale update lock
-	delete_option('core_updater.lock');
-
+	// Refresh core updates
 	wp_version_check();
-	$updates = get_site_transient('update_core');
+	$updates = get_site_transient( 'update_core' );
 
-	if (empty($updates->updates) || $updates->updates[0]->response !== 'upgrade') {
-		return new WP_REST_Response(['message' => 'No core update available'], 200);
+	if ( empty( $updates->updates ) || $updates->updates[0]->response !== 'upgrade' ) {
+		return new WP_REST_Response( [ 'message' => 'No core update available' ], 200 );
 	}
 
 	try {
-		$skin = new Silent_Upgrader_Skin();
-		$upgrader = new Core_Upgrader($skin);
-		$result = $upgrader->upgrade($updates->updates[0]);
-	} catch (Throwable $e) {
-		return new WP_REST_Response(['error' => $e->getMessage()], 500);
+		$skin     = new SUE_Silent_Core_Skin();
+		$upgrader = new Core_Upgrader( $skin );
+		$result   = $upgrader->upgrade( $updates->updates[0] );
+	} catch ( Throwable $e ) {
+		return new WP_REST_Response( [ 'error' => $e->getMessage() ], 500 );
 	}
 
-	if (is_wp_error($result)) {
-		return new WP_REST_Response(['error' => $result->get_error_message()], 500);
+	if ( is_wp_error( $result ) ) {
+		return new WP_REST_Response( [ 'error' => $result->get_error_message() ], 500 );
 	}
 
-	return new WP_REST_Response(['message' => 'WordPress core updated successfully'], 200);
+	return new WP_REST_Response( [ 'message' => 'WordPress core updated successfully' ], 200 );
 }
+
+//
+// -------- THEMES: POST /wp-json/custom/v1/update-themes --------
+//
+
+add_action( 'rest_api_init', function () {
+	register_rest_route( 'custom/v1', '/update-themes', [
+		'methods'             => 'POST',
+		'permission_callback' => function () {
+			return current_user_can( 'update_themes' );
+		},
+		'callback'            => 'sue_handle_update_themes',
+		'args'                => [
+			'themes' => [ 'required' => false ], // "all" | "all-installed" | CSV of stylesheets
+			'mode'   => [ 'required' => false ], // auto|single|bulk
+		],
+	] );
+} );
+
+function sue_handle_update_themes( WP_REST_Request $request ) {
+	sue_prepare_filesystem();
+
+	// Refresh available theme updates
+	wp_update_themes();
+
+	$param_themes = trim( (string) $request->get_param( 'themes' ) );
+	$mode         = strtolower( (string) ( $request->get_param( 'mode' ) ?: 'auto' ) );
+
+	// Build target list of theme stylesheets (keys of wp_get_themes)
+	$targets = [];
+	if ( $param_themes === '' || $param_themes === 'all' ) {
+		$updates = get_theme_updates();             // [stylesheet => obj]
+		$targets = array_keys( $updates );
+	} elseif ( $param_themes === 'all-installed' ) {
+		$targets = array_keys( wp_get_themes() );   // all stylesheets
+	} else {
+		$list     = array_filter( array_map( 'trim', explode( ',', $param_themes ) ) );
+		$installed = array_keys( wp_get_themes() );
+		$targets   = array_values( array_intersect( $list, $installed ) );
+	}
+
+	if ( empty( $targets ) ) {
+		return new WP_REST_Response( [
+			'ok'      => true,
+			'message' => 'No themes to update',
+			'results' => [],
+		], 200 );
+	}
+
+	if ( $mode === 'auto' ) {
+		$mode = ( count( $targets ) > 1 ) ? 'bulk' : 'single';
+	}
+
+	$overall_ok       = true;
+	$response_results = [];
+
+	if ( $mode === 'single' ) {
+		$stylesheet = $targets[0];
+		$skin       = new SUE_Silent_Single_Skin();
+		$upgrader   = new Theme_Upgrader( $skin );
+
+		$res = $upgrader->upgrade( $stylesheet );
+		$ok  = sue_result_ok( $res );
+		if ( ! $ok ) $overall_ok = false;
+
+		$response_results[ $stylesheet ] = [
+			'ok'       => $ok,
+			'raw'      => is_wp_error( $res ) ? $res->get_error_message() : ( is_array( $res ) ? $res : (bool) $res ),
+			'messages' => method_exists( $skin, 'get_messages' ) ? $skin->get_messages() : null,
+		];
+	} else {
+		$skin     = new SUE_Silent_Bulk_Theme_Skin( [ 'nonce' => 'bulk-update-themes' ] );
+		$upgrader = new Theme_Upgrader( $skin );
+
+		$results = $upgrader->bulk_upgrade( $targets ); // array keyed by stylesheet
+
+		foreach ( $targets as $stylesheet ) {
+			$res = $results[ $stylesheet ] ?? null;
+			$ok  = sue_result_ok( $res );
+			if ( ! $ok ) $overall_ok = false;
+
+			$response_results[ $stylesheet ] = [
+				'ok'  => $ok,
+				'raw' => is_wp_error( $res ) ? $res->get_error_message() : ( is_array( $res ) ? $res : (bool) $res ),
+			];
+		}
+
+		if ( method_exists( $skin, 'get_messages' ) ) {
+			$response_results['_messages'] = $skin->get_messages();
+		}
+	}
+
+	// Clean caches
+	delete_site_transient( 'update_themes' );
+	if ( function_exists( 'wp_clean_themes_cache' ) ) wp_clean_themes_cache( true );
+
+	return new WP_REST_Response( [
+		'ok'      => $overall_ok,
+		'mode'    => $mode,
+		'updated' => array_keys( array_filter( $response_results, fn( $r ) => ! isset( $r['ok'] ) || $r['ok'] ) ),
+		'results' => $response_results,
+	], 200 );
+}
+
+//
+// -------- Example curls (for reference) --------
+//
+// # Update one plugin exactly (single mode)
+// curl -X POST -u admin:admin \
+//  -d 'plugins=akismet/akismet.php&mode=single' \
+//  https://139.59.102.1/wp-json/custom/v1/update-plugins
+//
+// # Update everything with available updates (auto -> bulk)
+// curl -X POST -u admin:admin \
+//  -d 'plugins=all' \
+//  https://139.59.102.1/wp-json/custom/v1/update-plugins
+//
+// # Update specific plugins using native bulk logic
+// curl -X POST -u user:app-password \
+//  -d 'plugins=akismet/akismet.php,wordpress-seo/wp-seo.php&mode=bulk' \
+//  https://139.59.102.1/wp-json/custom/v1/update-plugins
+//
+// # Update one theme (by stylesheet directory name)
+// curl -X POST -u user:app-password \
+//  -d 'themes=twentytwentyfive&mode=single' \
+//  https://139.59.102.1/wp-json/custom/v1/update-themes
+//
+// # Update all themes with updates (bulk)
+// curl -X POST -u user:app-password \
+//  -d 'themes=all' \
+//  https://139.59.102.1/wp-json/custom/v1/update-themes
+//
+// # Update core
+// curl -X POST -u user:app-password https://139.59.102.1/wp-json/custom/v1/update-core
+//

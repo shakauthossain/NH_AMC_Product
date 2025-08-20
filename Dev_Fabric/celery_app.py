@@ -178,20 +178,21 @@ def wp_update_plugins_task(self,
     
     log.info(f"[task {self.request.id}] normalize: {selected_before} -> {selected}")
 
+    # Replace the whole try: ... except: block with this
     try:
-        plugin_result = (
-            out.get("plugins", {})
+        per_plugin = (
+            (out.get("plugins") or {})
             .get("result", {})
             .get("result", {})
-            .get("results", {})
+            .get("per_plugin", [])
         )
-        failures = {k: v for k, v in plugin_result.items() if not v.get("ok")}
-        successes = [k for k, v in plugin_result.items() if v.get("ok")]
+        successes = [x["plugin_file"] for x in per_plugin if x.get("updated")]
+        failures  = [x["plugin_file"] for x in per_plugin if x.get("updated") is False]
 
         if successes:
             log.info(f"[task {self.request.id}] ✅ Plugin(s) updated: {successes}")
         if failures:
-            log.warning(f"[task {self.request.id}] ❌ Plugin(s) failed: {failures}")
+            log.warning(f"[task {self.request.id}] ❌ Plugin(s) still stale after update: {failures}")
     except Exception as e:
         log.warning(f"[task {self.request.id}] ⚠️ Failed to parse plugin result details: {e}")
 
