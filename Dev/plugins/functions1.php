@@ -157,611 +157,552 @@ if ( ! function_exists( 'twentytwentyfive_format_binding' ) ) :
 	}
 endif;
 
+if ( ! defined( 'ABSPATH' ) ) exit;
 
-/* =========================================================================
-   Core includes required by upgraders / status
-   ========================================================================= */
+// --- Common Includes (load early) ---
 require_once ABSPATH . 'wp-admin/includes/plugin.php';
 require_once ABSPATH . 'wp-admin/includes/theme.php';
 require_once ABSPATH . 'wp-admin/includes/update.php';
-require_once ABSPATH . 'wp-admin/includes/class-wp-upgrader.php';
 require_once ABSPATH . 'wp-admin/includes/file.php';
+require_once ABSPATH . 'wp-admin/includes/class-wp-upgrader.php';
 
-/* =========================================================================
-   Global hardening (timeouts, temp, exec time)
-   ========================================================================= */
-add_filter('http_request_timeout', function($t){ return max((int)$t, 300); });
-@ini_set('max_execution_time', '900');
+//
+// -------- Silent Skins (no HTML output) --------
+//
 
-// ✅ #1: Force ZipArchive over PclZip
-add_filter('unzip_file_use_ziparchive', '__return_true');
-
-/* =========================================================================
-   Preflight checks (block risky upgrades that cause “vanish”)
-   ========================================================================= */
-function nh_updater_preflight_ok(&$why = null) {
-  if ( ! class_exists('ZipArchive') ) {
-    $why = 'PHP ZipArchive extension is missing'; return false;
-  }
-  if ( ! function_exists('curl_init') && ! ini_get('allow_url_fopen') ) {
-    $why = 'No HTTP transport (enable cURL or allow_url_fopen)'; return false;
-  }
-
-  // must be writable: upgrade, upgrade-temp-backup/plugins, plugins
-  $need_dirs = [
-    WP_CONTENT_DIR . '/upgrade',
-    WP_CONTENT_DIR . '/upgrade-temp-backup',
-    WP_CONTENT_DIR . '/upgrade-temp-backup/plugins',
-    WP_PLUGIN_DIR,
-  ];
-  foreach ($need_dirs as $d) {
-    if ( ! is_dir($d) ) { wp_mkdir_p($d); }
-    if ( ! wp_is_writable($d) ) { $why = basename($d) . ' is not writable'; return false; }
-  }
-  
-
-  // 50 MB minimum free space in wp-content
-  $free = @disk_free_space(WP_CONTENT_DIR);
-  if ($free !== false && $free < 50*1024*1024) {
-    $why = 'Low disk space in wp-content'; return false;
-  }
-  return true;
+class SUE_Silent_Single_Skin extends WP_Upgrader_Skin {
+	public array $messages = [];
+	public function header() {}
+	public function footer() {}
+	public function before() {}
+	public function after() {}
+	public function feedback( $string, ...$args ) {
+		if ( is_string( $string ) ) $this->messages[] = vsprintf( $string, (array) $args );
+	}
+	public function error( $errors ) {
+		$this->messages[] = is_wp_error( $errors ) ? $errors->get_error_message() : (string) $errors;
+	}
+	public function get_messages() { return $this->messages; }
 }
 
-/* =========================================================================
-   Robust downloader: guarantee a real .zip file path for the upgrader
-   ========================================================================= */
+class SUE_Silent_Bulk_Plugin_Skin extends Bulk_Plugin_Upgrader_Skin {
+	public array $messages = [];
+	public function header() {}
+	public function footer() {}
+	public function feedback( $string, ...$args ) {
+		if ( is_string( $string ) ) $this->messages[] = vsprintf( $string, (array) $args );
+	}
+	public function error( $errors ) {
+		$this->messages[] = is_wp_error( $errors ) ? $errors->get_error_message() : (string) $errors;
+	}
+	public function get_messages() { return $this->messages; }
+}
+
+class SUE_Silent_Bulk_Theme_Skin extends Bulk_Theme_Upgrader_Skin {
+	public array $messages = [];
+	public function header() {}
+	public function footer() {}
+	public function feedback( $string, ...$args ) {
+		if ( is_string( $string ) ) $this->messages[] = vsprintf( $string, (array) $args );
+	}
+	public function error( $errors ) {
+		$this->messages[] = is_wp_error( $errors ) ? $errors->get_error_message() : (string) $errors;
+	}
+	public function get_messages() { return $this->messages; }
+}
+
+class SUE_Silent_Core_Skin extends WP_Upgrader_Skin {
+	public array $messages = [];
+	public function header() {}
+	public function footer() {}
+	public function feedback( $string, ...$args ) {}
+	public function error( $errors ) {
+		$this->messages[] = is_wp_error( $errors ) ? $errors->get_error_message() : (string) $errors;
+	}
+	public function get_messages() { return $this->messages; }
+}
+
+//
+// -------- Helpers --------
+//
 
 /**
- * Optional: relax SSL verify if your box has a broken CA bundle.
- * Leave false unless you know you need it.
+ * Ensure filesystem is ready and use 'direct' where safe.
  */
-if ( ! defined('NH_UPDATER_RELAX_SSL') ) {
-  define('NH_UPDATER_RELAX_SSL', false);
+function sue_prepare_filesystem() {
+	if ( ! defined( 'FS_METHOD' ) ) {
+		define( 'FS_METHOD', 'direct' );
+	}
+	global $wp_filesystem;
+	if ( empty( $wp_filesystem ) ) {
+		WP_Filesystem();
+	}
 }
 
-/* Ensure the upgrader always prefers ZipArchive */
-add_filter('unzip_file_use_ziparchive', '__return_true');
-
-/* Give HTTP requests sane defaults for big zips */
-add_filter('http_request_args', function($args, $url){
-  $args['timeout']     = max( (int)($args['timeout'] ?? 0), 120 );
-  $args['redirection'] = max( (int)($args['redirection'] ?? 0), 5 );
-  if ( NH_UPDATER_RELAX_SSL ) {
-    $args['sslverify'] = false;
-  }
-  return $args;
-}, 10, 2);
-
-// Prefer ZipArchive (avoid PclZip whenever possible)
-add_filter('unzip_file_use_ziparchive', '__return_true');
-
-// Make downloads robust and deterministic
-remove_all_filters('upgrader_pre_download');
-add_filter('upgrader_pre_download', function($reply, $package, $upgrader){
-
-  // 1) Environment must be healthy
-  $why = null;
-  if ( ! nh_updater_preflight_ok($why) ) {
-    return new WP_Error('nh_preflight_failed', 'Update blocked: '.$why);
-  }
-
-  // 2) If core already gave us an on-disk file, sanity-check and return it
-  if ( is_string($package) && file_exists($package) ) {
-    if ( filesize($package) > 0 ) {
-      return $package;
-    }
-    return new WP_Error('nh_empty_package', 'Downloaded file exists but is empty: '.$package);
-  }
-
-  // 3) Expect a URL otherwise
-  if ( ! is_string($package) || stripos($package, 'http') !== 0 ) {
-    return new WP_Error('nh_bad_package', 'Invalid package reference (not a file or URL)');
-  }
-
-  // 4) Download to a PHP temp file
-  $tmp = download_url($package, 120);
-  if ( is_wp_error($tmp) ) {
-    error_log('[NH Updater] download_url failed: '.$package.' :: '.$tmp->get_error_message());
-    return $tmp;
-  }
-
-  // 5) Ensure a stable upgrade dir exists
-  $upgrade_dir = trailingslashit( WP_CONTENT_DIR ) . 'upgrade';
-  if ( ! is_dir($upgrade_dir) ) {
-    wp_mkdir_p($upgrade_dir);
-  }
-
-  // 6) Choose a sane .zip filename (even if the source is a non-zip URL)
-  $base = basename( parse_url($package, PHP_URL_PATH) );
-  if ( ! $base || strpos($base, '.') === false ) {
-    $base = 'package-' . time() . '.zip';
-  }
-  // Force .zip extension
-  $base_l = strtolower($base);
-  if ( ! str_ends_with($base_l, '.zip') ) {
-    $base .= '.zip';
-  }
-
-  $dest = trailingslashit($upgrade_dir) . wp_unique_filename($upgrade_dir, $base);
-
-  // 7) Move/copy tmp -> upgrade/filename.zip
-  $moved = @rename($tmp, $dest);
-  if ( ! $moved ) {
-    $copied = @copy($tmp, $dest);
-    @unlink($tmp);
-    if ( ! $copied ) {
-      error_log('[NH Updater] Failed moving downloaded file into upgrade dir: '.$dest);
-      return new WP_Error('nh_move_failed', 'Could not move downloaded zip into upgrade directory');
-    }
-  }
-
-  // 8) Final sanity: must exist & be non-empty; otherwise abort *before* unzip
-  if ( ! file_exists($dest) ) {
-    return new WP_Error('nh_missing_package', 'Downloaded zip vanished before unzip: '.$dest);
-  }
-  $size = @filesize($dest);
-  if ( ! $size || $size < 32*1024 /* 32KB guard */ ) {
-    return new WP_Error('nh_too_small_package', 'Downloaded zip is unexpectedly small: '.$dest.' ('.$size.' bytes)');
-  }
-
-  // 9) Hand the upgrader an absolute, verified path
-  return $dest;
-
-}, 10, 3);
-
-
-
-/* =========================================================================
-   Rescue / backup helpers
-   ========================================================================= */
-function nh_backup_plugin_dir(string $plugin_file) {
-  $slug = dirname($plugin_file);
-  $src  = WP_PLUGIN_DIR . '/' . $slug;
-  if ( ! is_dir($src) ) return false;
-
-  $backup_root = WP_CONTENT_DIR . '/plugin-backups';
-  if ( ! is_dir($backup_root) ) wp_mkdir_p($backup_root);
-
-  $backup = $backup_root . '/' . $slug . '-' . gmdate('Ymd-His');
-  WP_Filesystem(); global $wp_filesystem;
-  $ok = copy_dir($src, $backup);
-  return is_wp_error($ok) ? $ok : $backup;
+/**
+ * Normalize truthy check for upgrader results.
+ *
+ * @param mixed $res
+ * @return bool
+ */
+function sue_result_ok( $res ) {
+	// WP can return true, null (already latest), or an array without 'error'
+	if ( $res === true || $res === null ) return true;
+	if ( is_array( $res ) && empty( $res['error'] ) ) return true;
+	return ! is_wp_error( $res ) && (bool) $res;
 }
 
-function nh_restore_plugin_backup(string $backup_path, string $plugin_file) {
-  $slug = dirname($plugin_file);
-  $dest = WP_PLUGIN_DIR . '/' . $slug;
-  WP_Filesystem(); global $wp_filesystem;
-  if ( $wp_filesystem->exists($dest) ) $wp_filesystem->delete($dest, true);
-  $ok = copy_dir($backup_path, $dest);
-  return is_wp_error($ok) ? $ok : true;
+//
+// -------- STATUS: GET /wp-json/site/v1/status --------
+//
+
+add_action( 'rest_api_init', function () {
+	register_rest_route( 'site/v1', '/status', [
+		'methods'             => 'GET',
+		'permission_callback' => '__return_true',
+		'callback'            => function () {
+			require_once ABSPATH . 'wp-includes/version.php';
+
+			// Trigger update checks so transients are fresh.
+			wp_version_check();
+			wp_update_plugins();
+			wp_update_themes();
+
+			// Core info
+			$core_updates = get_site_transient( 'update_core' );
+			$core_info = [
+				'current_version'   => $GLOBALS['wp_version'],
+				'update_available'  => false,
+				'latest_version'    => null,
+			];
+			if ( ! empty( $core_updates->updates[0] ) && $core_updates->updates[0]->response !== 'latest' ) {
+				$core_info['update_available'] = true;
+				$core_info['latest_version']   = $core_updates->updates[0]->version;
+			}
+
+			// PHP & MySQL
+			global $wpdb;
+			$php_mysql_info = [
+				'php_version'   => phpversion(),
+				'mysql_version' => $wpdb->db_version(),
+			];
+
+			// Plugins
+			$all_plugins    = get_plugins();                // [plugin_file => data]
+			$active_plugins = get_option( 'active_plugins', [] );
+			$plugin_updates = get_plugin_updates();         // [plugin_file => (obj with ->update->new_version)]
+			$plugin_info    = [];
+
+			foreach ( $all_plugins as $plugin_file => $plugin_data ) {
+				$update = $plugin_updates[ $plugin_file ] ?? null;
+
+				$plugin_info[] = [
+					'plugin_file'      => $plugin_file, // e.g. akismet/akismet.php
+					'slug'             => sanitize_title( $plugin_data['Name'] ),
+					'name'             => $plugin_data['Name'],
+					'version'          => $plugin_data['Version'],
+					'active'           => in_array( $plugin_file, $active_plugins, true ),
+					'update_available' => (bool) $update,
+					'latest_version'   => $update->update->new_version ?? $plugin_data['Version'],
+				];
+			}
+
+			// Themes
+			$themes         = wp_get_themes();             // [stylesheet => WP_Theme]
+			$active_theme   = wp_get_theme();
+			$theme_updates  = get_theme_updates();         // [stylesheet => (obj->update->new_version)]
+			$theme_info     = [];
+
+			foreach ( $themes as $stylesheet => $theme ) {
+				$update = $theme_updates[ $stylesheet ] ?? null;
+				$theme_info[] = [
+					'stylesheet'       => $stylesheet,
+					'name'             => $theme->get( 'Name' ),
+					'version'          => $theme->get( 'Version' ),
+					'active'           => ( $theme->get_stylesheet() === $active_theme->get_stylesheet() ),
+					'update_available' => (bool) $update,
+					'latest_version'   => $update->update->new_version ?? null,
+				];
+			}
+
+			return [
+				'core'      => $core_info,
+				'php_mysql' => $php_mysql_info,
+				'plugins'   => $plugin_info,
+				'themes'    => $theme_info,
+			];
+		},
+	] );
+} );
+
+//
+// -------- PLUGINS: POST /wp-json/custom/v1/update-plugins --------
+//
+
+add_action( 'rest_api_init', function () {
+	register_rest_route( 'custom/v1', '/update-plugins', [
+		'methods'             => 'POST',
+		'permission_callback' => function () {
+			return current_user_can( 'update_plugins' );
+		},
+		'callback'            => 'sue_handle_update_plugins',
+		'args'                => [
+			'plugins' => [ 'required' => false ],
+			'mode'    => [ 'required' => false ], // auto|single|bulk
+		],
+	] );
+} );
+
+// [2] Helper: delete WP_CONTENT_DIR/upgrade-temp-backup/plugins/<slug>
+if ( ! function_exists( 'nh_delete_plugin_backup_dir' ) ) {
+	require_once ABSPATH . 'wp-admin/includes/file.php';
+
+	/**
+	 * Delete upgrade-temp-backup dir for a plugin (if exists).
+	 * @param string $plugin_file e.g. "all-in-one-wp-migration/all-in-one-wp-migration.php"
+	 */
+	function nh_delete_plugin_backup_dir( string $plugin_file ): bool {
+		$slug = dirname( $plugin_file ); // "all-in-one-wp-migration"
+		$base = WP_CONTENT_DIR . '/upgrade-temp-backup/plugins';
+		$dir  = trailingslashit( $base ) . untrailingslashit( $slug );
+
+		if ( ! file_exists( $dir ) ) {
+			return false;
+		}
+
+		global $wp_filesystem;
+		if ( ! $wp_filesystem ) {
+			WP_Filesystem();
+		}
+		if ( $wp_filesystem && $wp_filesystem->is_dir( $dir ) ) {
+			return (bool) $wp_filesystem->delete( $dir, true );
+		}
+		return false;
+	}
 }
 
-/** Rescue from both classic temp and the rollback folder (WP 6.5+) */
-function nh_rescue_plugin_if_stuck($slug){
-  $roots = [
-    trailingslashit(WP_CONTENT_DIR).'upgrade',
-    trailingslashit(WP_CONTENT_DIR).'upgrade-temp-backup/plugins',
-  ];
+// [3] Helper: filesystem diagnostics (writability, existence) for targets
+if ( ! function_exists( 'nh_fs_preflight_plugins' ) ) {
+	require_once ABSPATH . 'wp-admin/includes/file.php';
 
-  foreach ($roots as $root) {
-    if ( ! is_dir($root) ) continue;
+	/**
+	 * Return FS diagnostics for plugin update preflight.
+	 * @param array $targets array of plugin_file basenames
+	 * @return array
+	 */
+	function nh_fs_preflight_plugins( array $targets ): array {
+		$base_src = WP_PLUGIN_DIR; // wp-content/plugins
+		$base_bak = WP_CONTENT_DIR . '/upgrade-temp-backup/plugins';
 
-    // direct match
-    $direct = trailingslashit($root) . $slug;
-    if ( is_dir($direct) ) {
-      $src = $direct;
-    } else {
-      // nested: <root>/<random>/[maybe slug or slug-prefixed]
-      $src = null;
-      foreach (glob(trailingslashit($root).'*', GLOB_ONLYDIR) as $cand) {
-        // exact child or slug-prefixed child (e.g., akismet-20250818-123456)
-        if ( basename($cand) === $slug || str_starts_with(basename($cand), $slug.'-') ) {
-          $src = $cand;
-          break;
-        }
-        // or a nested child named slug
-        if ( is_dir(trailingslashit($cand).$slug) ) {
-          $src = trailingslashit($cand).$slug;
-          break;
-        }
-      }
-      if ( ! $src ) continue;
-    }
+		// Ensure backup base exists
+		wp_mkdir_p( $base_bak );
 
-    $dest = WP_PLUGIN_DIR . '/' . $slug;
-    WP_Filesystem(); global $wp_filesystem;
-    if ( $wp_filesystem->exists($dest) ) $wp_filesystem->delete($dest, true);
+		$checks = [
+			'wp_plugin_dir_writable' => wp_is_writable( $base_src ),
+			'backup_base_exists'     => is_dir( $base_bak ),
+			'backup_base_writable'   => wp_is_writable( $base_bak ),
+			'php_user'               => ( function_exists( 'posix_getpwuid' ) && function_exists( 'posix_geteuid' ) )
+				? ( posix_getpwuid( posix_geteuid() )['name'] ?? 'unknown' )
+				: 'unknown',
+			'slugs'                  => [],
+		];
 
-    $ok = copy_dir($src, $dest);
-    if ( ! is_wp_error($ok) ) return true;
-  }
-  return false;
+		foreach ( $targets as $pf ) {
+			$slug = dirname( $pf );
+			$src  = trailingslashit( $base_src ) . $slug;
+			$bak  = trailingslashit( $base_bak ) . $slug;
+
+			$checks['slugs'][ $slug ] = [
+				'source_exists'       => is_dir( $src ),
+				'source_writable'     => wp_is_writable( $src ),
+				'backup_exists'       => is_dir( $bak ),
+				'backup_writable_par' => wp_is_writable( dirname( $bak ) ),
+			];
+		}
+
+		return $checks;
+	}
 }
 
-
-/* Auto-rescue when core upgrader reports an error */
-add_filter('upgrader_install_package_result', function($result, $hook_extra){
-  if ( isset($hook_extra['type']) && $hook_extra['type']==='plugin' && is_wp_error($result) ) {
-    $slug = ! empty($hook_extra['plugin']) ? dirname($hook_extra['plugin']) : '';
-    if ( $slug && nh_rescue_plugin_if_stuck($slug) ) {
-      return ['rescued'=>true,'slug'=>$slug,'from'=>'rollback/upgrade'];
-    }
-  }
-  return $result;
-}, 10, 2);
-
-/* After install: verify destination; if missing, rollback from backup */
-global $nh_plugin_backups;
-$nh_plugin_backups = [];
-
-add_filter('upgrader_pre_install', function($true, $hook_extra){
-  if ( isset($hook_extra['type']) && $hook_extra['type'] === 'plugin' && ! empty($hook_extra['plugin']) ) {
-    $pf = $hook_extra['plugin'];
-    $backup = nh_backup_plugin_dir($pf);
-    $GLOBALS['nh_plugin_backups'][$pf] = $backup;
-  }
-  return $true;
-}, 10, 2);
-
-add_filter('upgrader_post_install', function($true, $hook_extra, $result){
-  if ( isset($hook_extra['type']) && $hook_extra['type'] === 'plugin' && ! empty($hook_extra['plugin']) ) {
-    $pf   = $hook_extra['plugin'];
-    $slug = dirname($pf);
-    $dest = WP_PLUGIN_DIR . '/' . $slug;
-
-    if ( ! is_dir($dest) ) {
-      // try rescue; if still missing, rollback
-      if ( ! nh_rescue_plugin_if_stuck($slug) ) {
-        $backup = $GLOBALS['nh_plugin_backups'][$pf] ?? null;
-        if ( is_string($backup) ) nh_restore_plugin_backup($backup, $pf);
-        return new WP_Error('nh_restore', 'Install failed; restored previous version for '.$pf);
-      }
-    }
-  }
-  return $true;
-}, 10, 3);
-
-/* Flush plugins cache after any plugin process completes */
-add_action('upgrader_process_complete', function($upgrader, $hook_extra){
-  if ( ! empty($hook_extra['type']) && $hook_extra['type'] === 'plugin' ) {
-    delete_site_transient('update_plugins');
-    if ( function_exists('wp_clean_plugins_cache') ) wp_clean_plugins_cache(true);
-  }
-}, 10, 2);
-
-/* =========================================================================
-   STATUS: /wp-json/site/v1/status   (with robust core latest)
-   ========================================================================= */
-add_action('rest_api_init', function () {
-  register_rest_route('site/v1', '/status', [
-    'methods'             => 'GET',
-    'permission_callback' => '__return_true',
-    'callback'            => function () {
-
-      // Refresh transients similar to wp-admin
-      wp_version_check();
-      wp_update_plugins();
-      wp_update_themes();
-
-      // ----- Core latest via get_core_updates -----
-      require_once ABSPATH . 'wp-includes/version.php';
-      $installed = $GLOBALS['wp_version'];
-      delete_site_transient('update_core');
-      wp_version_check();
-
-      $offers = get_core_updates();
-      $latest = $installed; $has_upgrade = false;
-      if (is_array($offers) && !empty($offers)) {
-        foreach ($offers as $o) {
-          $ver = $o->current ?? ($o->version ?? null);
-          if ($ver && version_compare($ver, $latest, '>')) $latest = $ver;
-          if (($o->response ?? '') === 'upgrade') $has_upgrade = true;
-        }
-      }
-      $core_info = [
-        'current_version'  => $installed,
-        'latest_version'   => $latest,
-        'update_available' => $has_upgrade || version_compare($latest, $installed, '>'),
-      ];
-
-      // ----- PHP & MySQL -----
-      global $wpdb;
-      $php_mysql_info = [
-        'php_version'   => phpversion(),
-        'mysql_version' => $wpdb->db_version()
-      ];
-
-      // ----- Plugins -----
-      $all_plugins     = get_plugins();
-      $active_plugins  = get_option('active_plugins', []);
-      $plugin_updates  = get_plugin_updates();
-      $plugin_info     = [];
-
-      foreach ($all_plugins as $plugin_file => $plugin_data) {
-        $update = $plugin_updates[$plugin_file] ?? null;
-        $plugin_info[] = [
-          'plugin_file'      => $plugin_file,
-          'slug'             => sanitize_title($plugin_data['Name']),
-          'name'             => $plugin_data['Name'],
-          'version'          => $plugin_data['Version'],
-          'active'           => in_array($plugin_file, $active_plugins, true),
-          'update_available' => (bool) $update,
-          'latest_version'   => $update->update->new_version ?? $plugin_data['Version'],
-        ];
-      }
-
-      // ----- Themes -----
-      $themes        = wp_get_themes();
-      $active_theme  = wp_get_theme();
-      $theme_updates = get_theme_updates();
-      $theme_info    = [];
-      foreach ($themes as $slug => $theme) {
-        $update = $theme_updates[$slug] ?? null;
-        $theme_info[] = [
-          'name'             => $theme->get('Name'),
-          'version'          => $theme->get('Version'),
-          'active'           => $theme->get_stylesheet() === $active_theme->get_stylesheet(),
-          'update_available' => (bool) $update,
-          'latest_version'   => $update->update->new_version ?? null,
-        ];
-      }
-
-      return new WP_REST_Response([
-        'core'      => $core_info,
-        'php_mysql' => $php_mysql_info,
-        'plugins'   => $plugin_info,
-        'themes'    => $theme_info,
-      ], 200);
-    },
-  ]);
-});
-
-/* =========================================================================
-   Helpers to parse incoming plugin list for REST
-   ========================================================================= */
-function nh_parse_plugins_from_request(WP_REST_Request $request): array {
-  $plugins = [];
-
-  // JSON body support
-  $raw = $request->get_body();
-  if (is_string($raw) && strlen(trim($raw))) {
-    $data = json_decode($raw, true);
-    if (is_array($data) && array_key_exists('plugins', $data)) {
-      if (is_array($data['plugins'])) { $plugins = array_map('strval', $data['plugins']); }
-      elseif (is_string($data['plugins'])) { $plugins = preg_split('/\s*,\s*/', $data['plugins'], -1, PREG_SPLIT_NO_EMPTY); }
-    }
-  }
-  // Form body fallback
-  if (empty($plugins)) {
-    $paramArr = $request->get_param('plugins');
-    if (is_array($paramArr)) { $plugins = array_map('strval', $paramArr); }
-    elseif (is_string($paramArr) && strlen(trim($paramArr))) { $plugins = preg_split('/\s*,\s*/', $paramArr, -1, PREG_SPLIT_NO_EMPTY); }
-  }
-  // Final clean
-  $plugins = array_values(array_filter(array_map('trim', $plugins), fn($p)=> is_string($p) && $p!==''));
-  return $plugins;
+// [4] (Optional) Janitor: prune old leftover backups > 1h
+if ( ! function_exists( 'nh_prune_old_backups' ) ) {
+	function nh_prune_old_backups( int $max_age_secs = 3600 ): void {
+		$base = WP_CONTENT_DIR . '/upgrade-temp-backup/plugins';
+		if ( ! is_dir( $base ) ) { return; }
+		foreach ( glob( $base . '/*', GLOB_ONLYDIR ) as $d ) {
+			$age = time() - @filemtime( $d );
+			if ( $age > $max_age_secs ) {
+				// fabricate a plugin_file so deleter can compute slug path
+				$slug = basename( $d );
+				nh_delete_plugin_backup_dir( $slug . '/plugin.php' );
+			}
+		}
+	}
 }
 
-/* =========================================================================
-   /custom/v1/update-plugins  (safe batch updates + mutex lock)
-   ========================================================================= */
-add_action('rest_api_init', function () {
-  register_rest_route('custom/v1', '/update-plugins', [
-    'methods'             => 'POST',
-    'permission_callback' => function () { return current_user_can('update_plugins'); },
-    'callback'            => function ( WP_REST_Request $request ) {
+// [5] Handler
+function sue_handle_update_plugins( WP_REST_Request $request ) {
+	// Ensure WP upgrader & plugin APIs are loaded (no-ops if already)
+	require_once ABSPATH . 'wp-admin/includes/update.php';
+	require_once ABSPATH . 'wp-admin/includes/plugin.php';
+	require_once ABSPATH . 'wp-admin/includes/class-wp-upgrader.php';
+	require_once ABSPATH . 'wp-admin/includes/file.php';
 
-      // ---- Mutex: prevent overlapping updates from frontend/wp-admin ----
-      $lock_key = 'nh_plugins_updating_lock';
-      if ( get_transient($lock_key) ) {
-        return new WP_REST_Response(['ok'=>false,'error'=>'Another update is in progress'], 409);
-      }
-      set_transient($lock_key, 1, 15 * MINUTE_IN_SECONDS);
+	// Your existing helper should set FS_METHOD/direct etc.
+	if ( function_exists( 'sue_prepare_filesystem' ) ) {
+		sue_prepare_filesystem();
+	}
 
-      try {
-        // ---- Preflight sanity (writable dirs, zip, curl, free space) ----
-        $why = null;
-        if ( ! nh_updater_preflight_ok($why) ) {
-          return new WP_REST_Response(['ok'=>false, 'error'=>'Preflight failed: '.$why], 500);
-        }
+	// Refresh available plugin updates
+	wp_update_plugins();
 
-        // Direct FS writes (no FTP creds), ensure WP_Filesystem ready
-        //if (!defined('FS_METHOD')) define('FS_METHOD', 'direct');
-        //global $wp_filesystem; if (empty($wp_filesystem)) WP_Filesystem();
+	$param_plugins = trim( (string) $request->get_param( 'plugins' ) );
+	$mode          = strtolower( (string) ( $request->get_param( 'mode' ) ?: 'auto' ) );
 
-        // ---- Parse list of plugin files from request ----
-        // Accepts: JSON {"plugins":["a/b.php","c/d.php"]}, CSV, or form arrays
-        $plugins = nh_parse_plugins_from_request($request);
-        if (empty($plugins)) {
-          return new WP_REST_Response(['ok'=>false,'error'=>'No plugins provided'], 400);
-        }
+	// Build target list of plugin basenames
+	$targets = [];
+	if ( $param_plugins === '' || $param_plugins === 'all' ) {
+		$updates = get_plugin_updates(); // only those with updates
+		$targets = array_keys( $updates );
+	} elseif ( $param_plugins === 'all-installed' ) {
+		$targets = array_keys( get_plugins() );
+	} else {
+		$list      = array_filter( array_map( 'trim', explode( ',', $param_plugins ) ) );
+		$installed = array_keys( get_plugins() );
+		$targets   = array_values( array_intersect( $list, $installed ) );
+	}
 
-        // Support {"plugins":"all"} to upgrade only those with updates available
-        if (count($plugins) === 1 && strtolower($plugins[0]) === 'all') {
-          wp_update_plugins();
-          $updates = get_plugin_updates();          // keyed by plugin_file
-          $plugins = array_keys($updates);          // only plugins needing updates
-          if (empty($plugins)) {
-            return new WP_REST_Response(['ok'=>true,'results'=>[],'post_status'=>[]], 200);
-          }
-        }
+	// PRE-CLEAN: ensure base dir & remove any stale backup dirs for targets
+	wp_mkdir_p( WP_CONTENT_DIR . '/upgrade-temp-backup/plugins' );
+	foreach ( $targets as $__pf ) {
+		nh_delete_plugin_backup_dir( $__pf );
+	}
+	$fs_diag = nh_fs_preflight_plugins( $targets ); // collect diagnostics
 
-        // Refresh update transients before starting
-        wp_update_plugins();
+	if ( empty( $targets ) ) {
+		return new WP_REST_Response( [
+			'ok'      => true,
+			'message' => 'No plugins to update',
+			'results' => [],
+			'fs_diag' => $fs_diag,
+		], 200 );
+	}
 
-        // Quiet skin that captures feedback/errors
-        $skin = new class extends WP_Upgrader_Skin {
-          public array $messages = [];
-          public function header() {}
-          public function footer() {}
-          public function before() {}
-          public function after() {}
-          public function error($e) { $this->messages[] = is_wp_error($e) ? $e->get_error_message() : (string)$e; }
-          public function feedback($s, ...$a) { if (is_string($s)) $this->messages[] = vsprintf($s, (array)$a); }
-          public function get_upgrade_messages(){ return $this->messages; }
-        };
+	if ( $mode === 'auto' ) {
+		$mode = ( count( $targets ) > 1 ) ? 'bulk' : 'single';
+	}
 
-        $upgrader = new Plugin_Upgrader($skin);
-        $results  = [];
+	$overall_ok       = true;
+	$response_results = [];
 
-        foreach ($plugins as $pf) {
-          $pf = trim($pf);
-          if ($pf === '') continue;
+	if ( $mode === 'single' ) {
+		$plugin_file = $targets[0];
+		$skin        = class_exists( 'SUE_Silent_Single_Skin' ) ? new SUE_Silent_Single_Skin() : new Automatic_Upgrader_Skin();
+		$upgrader    = new Plugin_Upgrader( $skin );
 
-          // Best-effort backup of current plugin directory
-          $backup = nh_backup_plugin_dir($pf);
+		$res = $upgrader->upgrade( $plugin_file ); // bool|array|WP_Error|null
+		$ok  = function_exists( 'sue_result_ok' ) ? sue_result_ok( $res ) : ( ! is_wp_error( $res ) && ( $res || is_array( $res ) ) );
+		if ( ! $ok ) { $overall_ok = false; }
 
-          // Run the upgrade (returns bool|array|WP_Error)
-          $res = $upgrader->upgrade($pf);
-          $ok  = ($res === true) || (is_array($res) && empty($res['error']));
+		$response_results[ $plugin_file ] = [
+			'ok'       => (bool) $ok,
+			'raw'      => is_wp_error( $res ) ? $res->get_error_message() : ( is_array( $res ) ? $res : (bool) $res ),
+			'messages' => method_exists( $skin, 'get_messages' ) ? $skin->get_messages() : null,
+		];
 
-          // If failed, try rescuing from upgrade/rollback temp folders
-          if ( ! $ok ) {
-            $slug = dirname($pf);
-            if ( nh_rescue_plugin_if_stuck($slug) ) {
-              $ok = true;
-            }
-          }
+		// POST-CLEAN: remove backup dir when update succeeded
+		if ( $ok ) {
+			nh_delete_plugin_backup_dir( $plugin_file );
+		}
 
-          // Verify destination exists; if missing, attempt rollback from backup
-          $dest_dir = WP_PLUGIN_DIR . '/' . dirname($pf);
-          if ( ! $ok || ! is_dir($dest_dir) ) {
-            if ( is_string($backup) ) {
-              $rest = nh_restore_plugin_backup($backup, $pf);
-              // If restored, we mark as failed update but plugin present
-              if ($rest === true) { $ok = false; }
-            }
-          }
+	} else {
+		// BULK – mirrors wp-admin’s "Update Selected"
+		$skin     = class_exists( 'SUE_Silent_Bulk_Plugin_Skin' ) ? new SUE_Silent_Bulk_Plugin_Skin( [ 'nonce' => 'bulk-update-plugins' ] ) : new Bulk_Plugin_Upgrader_Skin();
+		$upgrader = new Plugin_Upgrader( $skin );
 
-          // Collect messages and outcome for this plugin
-          $messages = method_exists($upgrader->skin, 'get_upgrade_messages')
-                     ? $upgrader->skin->get_upgrade_messages()
-                     : null;
+		$results = $upgrader->bulk_upgrade( $targets ); // array keyed by plugin_file
 
-          $results[] = [
-            'plugin'   => $pf,
-            'ok'       => (bool)$ok,
-            'restored' => (!$ok && is_string($backup)),
-            'raw'      => is_wp_error($res) ? $res->get_error_message() : (is_array($res) ? $res : (bool)$res),
-            'messages' => $messages,
-          ];
+		foreach ( $targets as $plugin_file ) {
+			$res = $results[ $plugin_file ] ?? null;
+			$ok  = function_exists( 'sue_result_ok' ) ? sue_result_ok( $res ) : ( ! is_wp_error( $res ) && ( $res || is_array( $res ) ) );
+			if ( ! $ok ) { $overall_ok = false; }
 
-          // Keep dashboard state fresh during batches
-          delete_site_transient('update_plugins');
-          if ( function_exists('wp_clean_plugins_cache') ) wp_clean_plugins_cache(true);
-        }
+			$response_results[ $plugin_file ] = [
+				'ok'  => (bool) $ok,
+				'raw' => is_wp_error( $res ) ? $res->get_error_message() : ( is_array( $res ) ? $res : (bool) $res ),
+			];
 
-        // Report post-update plugin versions
-        $post = [];
-        foreach ($plugins as $pf) {
-          $data = get_plugin_data(WP_PLUGIN_DIR . '/' . $pf, false, false);
-          $post[$pf] = [
-            'name'    => $data['Name'] ?? null,
-            'version' => $data['Version'] ?? null,
-          ];
-        }
+			// POST-CLEAN per plugin on success
+			if ( $ok ) {
+				nh_delete_plugin_backup_dir( $plugin_file );
+			}
+		}
 
-        // Overall success
-        $overall_ok = true;
-        foreach ($results as $r) { if (empty($r['ok'])) { $overall_ok = false; break; } }
+		if ( method_exists( $skin, 'get_messages' ) ) {
+			$response_results['_messages'] = $skin->get_messages();
+		}
+	}
 
-        return new WP_REST_Response([
-          'ok'          => $overall_ok,
-          'results'     => $results,
-          'post_status' => $post,
-        ], 200);
+	// Clean caches + prune old leftovers
+	delete_site_transient( 'update_plugins' );
+	if ( function_exists( 'wp_clean_plugins_cache' ) ) {
+		wp_clean_plugins_cache( true );
+	}
+	if ( function_exists( 'nh_prune_old_backups' ) ) {
+		nh_prune_old_backups( 3600 ); // 1 hour
+	}
 
-      } finally {
-        // Always release the lock
-        delete_transient($lock_key);
-      }
-    },
-  ]);
-});
-/* =========================================================================
-   /custom/v1/update-core  (unchanged behavior, small tidy)
-   ========================================================================= */
-add_action('rest_api_init', function () {
-  register_rest_route('custom/v1', '/update-core', [
-    'methods'             => 'POST',
-    'permission_callback' => function () { return current_user_can('update_core'); },
-    'callback'            => function ( WP_REST_Request $request ) {
+	return new WP_REST_Response( [
+		'ok'      => (bool) $overall_ok,
+		'mode'    => $mode,
+		'updated' => array_keys( array_filter( $response_results, function( $r ) { return ! isset( $r['ok'] ) || $r['ok']; } ) ),
+		'results' => $response_results,
+		'fs_diag' => $fs_diag,
+	], 200 );
+}
 
-      if (!defined('FS_METHOD')) define('FS_METHOD', 'direct');
-      global $wp_filesystem; if (empty($wp_filesystem)) WP_Filesystem();
+//
+// -------- CORE: POST /wp-json/custom/v1/update-core --------
+//
 
-      delete_option('core_updater.lock');
-      delete_site_transient('update_core');
-      wp_version_check();
+add_action( 'rest_api_init', function () {
+	register_rest_route( 'custom/v1', '/update-core', [
+		'methods'             => 'POST',
+		'permission_callback' => function () {
+			return current_user_can( 'update_core' );
+		},
+		'callback'            => 'sue_handle_update_core',
+	] );
+} );
 
-      $offers = get_core_updates();
-      if (empty($offers)) return new WP_REST_Response(['message'=>'No core update info available'], 200);
+function sue_handle_update_core( WP_REST_Request $request ) {
+	sue_prepare_filesystem();
 
-      $candidate = null;
-      foreach ($offers as $o) { if (($o->response ?? '') === 'upgrade') { $candidate = $o; break; } }
-      if (!$candidate) return new WP_REST_Response(['message'=>'No core update available'], 200);
+	// Clear any stale core lock
+	delete_option( 'core_updater.lock' );
 
-      // Silent skin
-      if (!class_exists('NH_Silent_Upgrader_Skin')) {
-        class NH_Silent_Upgrader_Skin extends WP_Upgrader_Skin {
-          public function header() {}
-          public function footer() {}
-          public function feedback($string, ...$args) {}
-          public function error($errors) {}
-          public function before() {}
-          public function after() {}
-        }
-      }
+	// Refresh core updates
+	wp_version_check();
+	$updates = get_site_transient( 'update_core' );
 
-      try {
-        $upgrader = new Core_Upgrader(new NH_Silent_Upgrader_Skin());
-        $result   = $upgrader->upgrade($candidate);
-      } catch (Throwable $e) {
-        return new WP_REST_Response(['error'=>$e->getMessage()], 500);
-      }
-      if (is_wp_error($result)) return new WP_REST_Response(['error'=>$result->get_error_message()], 500);
+	if ( empty( $updates->updates ) || $updates->updates[0]->response !== 'upgrade' ) {
+		return new WP_REST_Response( [ 'message' => 'No core update available' ], 200 );
+	}
 
-      delete_site_transient('update_core');
-      return new WP_REST_Response(['message'=>'WordPress core updated successfully'], 200);
-    },
-  ]);
-});
+	try {
+		$skin     = new SUE_Silent_Core_Skin();
+		$upgrader = new Core_Upgrader( $skin );
+		$result   = $upgrader->upgrade( $updates->updates[0] );
+	} catch ( Throwable $e ) {
+		return new WP_REST_Response( [ 'error' => $e->getMessage() ], 500 );
+	}
 
-add_action('rest_api_init', function () {
-  register_rest_route('custom/v1', '/preflight', [
-    'methods'  => 'GET',
-    'permission_callback' => '__return_true',
-    'callback' => function () {
-      $why = null;
-      $ok  = nh_updater_preflight_ok($why);
-      return new WP_REST_Response([
-        'ok'  => (bool) $ok,
-        'why' => $ok ? null : (string) $why,
-        'dirs' => [
-          'upgrade' => [
-            'path' => WP_CONTENT_DIR . '/upgrade',
-            'exists' => is_dir(WP_CONTENT_DIR . '/upgrade'),
-            'writable' => wp_is_writable(WP_CONTENT_DIR . '/upgrade'),
-          ],
-          'rollback' => [
-            'path' => WP_CONTENT_DIR . '/upgrade-temp-backup/plugins',
-            'exists' => is_dir(WP_CONTENT_DIR . '/upgrade-temp-backup/plugins'),
-            'writable' => wp_is_writable(WP_CONTENT_DIR . '/upgrade-temp-backup/plugins'),
-          ],
-          'plugins' => [
-            'path' => WP_PLUGIN_DIR,
-            'exists' => is_dir(WP_PLUGIN_DIR),
-            'writable' => wp_is_writable(WP_PLUGIN_DIR),
-          ],
-        ],
-        'zip'  => class_exists('ZipArchive'),
-        'curl' => function_exists('curl_init') || (bool) ini_get('allow_url_fopen'),
-      ], 200);
-    },
-  ]);
-});
+	if ( is_wp_error( $result ) ) {
+		return new WP_REST_Response( [ 'error' => $result->get_error_message() ], 500 );
+	}
 
+	return new WP_REST_Response( [ 'message' => 'WordPress core updated successfully' ], 200 );
+}
 
+//
+// -------- THEMES: POST /wp-json/custom/v1/update-themes --------
+//
 
+add_action( 'rest_api_init', function () {
+	register_rest_route( 'custom/v1', '/update-themes', [
+		'methods'             => 'POST',
+		'permission_callback' => function () {
+			return current_user_can( 'update_themes' );
+		},
+		'callback'            => 'sue_handle_update_themes',
+		'args'                => [
+			'themes' => [ 'required' => false ], // "all" | "all-installed" | CSV of stylesheets
+			'mode'   => [ 'required' => false ], // auto|single|bulk
+		],
+	] );
+} );
+
+function sue_handle_update_themes( WP_REST_Request $request ) {
+	sue_prepare_filesystem();
+
+	// Refresh available theme updates
+	wp_update_themes();
+
+	$param_themes = trim( (string) $request->get_param( 'themes' ) );
+	$mode         = strtolower( (string) ( $request->get_param( 'mode' ) ?: 'auto' ) );
+
+	// Build target list of theme stylesheets (keys of wp_get_themes)
+	$targets = [];
+	if ( $param_themes === '' || $param_themes === 'all' ) {
+		$updates = get_theme_updates();             // [stylesheet => obj]
+		$targets = array_keys( $updates );
+	} elseif ( $param_themes === 'all-installed' ) {
+		$targets = array_keys( wp_get_themes() );   // all stylesheets
+	} else {
+		$list     = array_filter( array_map( 'trim', explode( ',', $param_themes ) ) );
+		$installed = array_keys( wp_get_themes() );
+		$targets   = array_values( array_intersect( $list, $installed ) );
+	}
+
+	if ( empty( $targets ) ) {
+		return new WP_REST_Response( [
+			'ok'      => true,
+			'message' => 'No themes to update',
+			'results' => [],
+		], 200 );
+	}
+
+	if ( $mode === 'auto' ) {
+		$mode = ( count( $targets ) > 1 ) ? 'bulk' : 'single';
+	}
+
+	$overall_ok       = true;
+	$response_results = [];
+
+	if ( $mode === 'single' ) {
+		$stylesheet = $targets[0];
+		$skin       = new SUE_Silent_Single_Skin();
+		$upgrader   = new Theme_Upgrader( $skin );
+
+		$res = $upgrader->upgrade( $stylesheet );
+		$ok  = sue_result_ok( $res );
+		if ( ! $ok ) $overall_ok = false;
+
+		$response_results[ $stylesheet ] = [
+			'ok'       => $ok,
+			'raw'      => is_wp_error( $res ) ? $res->get_error_message() : ( is_array( $res ) ? $res : (bool) $res ),
+			'messages' => method_exists( $skin, 'get_messages' ) ? $skin->get_messages() : null,
+		];
+	} else {
+		$skin     = new SUE_Silent_Bulk_Theme_Skin( [ 'nonce' => 'bulk-update-themes' ] );
+		$upgrader = new Theme_Upgrader( $skin );
+
+		$results = $upgrader->bulk_upgrade( $targets ); // array keyed by stylesheet
+
+		foreach ( $targets as $stylesheet ) {
+			$res = $results[ $stylesheet ] ?? null;
+			$ok  = sue_result_ok( $res );
+			if ( ! $ok ) $overall_ok = false;
+
+			$response_results[ $stylesheet ] = [
+				'ok'  => $ok,
+				'raw' => is_wp_error( $res ) ? $res->get_error_message() : ( is_array( $res ) ? $res : (bool) $res ),
+			];
+		}
+
+		if ( method_exists( $skin, 'get_messages' ) ) {
+			$response_results['_messages'] = $skin->get_messages();
+		}
+	}
+
+	// Clean caches
+	delete_site_transient( 'update_themes' );
+	if ( function_exists( 'wp_clean_themes_cache' ) ) wp_clean_themes_cache( true );
+
+	return new WP_REST_Response( [
+		'ok'      => $overall_ok,
+		'mode'    => $mode,
+		'updated' => array_keys( array_filter( $response_results, fn( $r ) => ! isset( $r['ok'] ) || $r['ok'] ) ),
+		'results' => $response_results,
+	], 200 );
+}

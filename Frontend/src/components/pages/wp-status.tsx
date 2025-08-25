@@ -183,7 +183,7 @@ export function WPStatusPage() {
       // Try to construct a proper WP REST API URL
       const baseUrl = domain.startsWith('http') ? domain : `http://${domain}`;
       // console.log("baseUrl", baseUrl);
-      const restUrl = `${baseUrl}/wp-json/site/v1/status`;
+      const restUrl = `${baseUrl}/wp-json/custom/v1/status`;
       // console.log("restUrl", restUrl);
       
       try {

@@ -75,15 +75,34 @@ def domain_ssl_collect_task(self, domain: str, report_email: str | None = None):
     return result
 
 @celery.task(bind=True, name="wp.outdated.fetch")
-def wp_outdated_fetch_task(self, url: str, headers: dict | None = None, report_email: str | None = None):
-    log.info(f"[task {self.request.id}] wp_outdated_fetch url={url}")
+def wp_outdated_fetch_task(self,
+                           url: str,
+                           headers: dict | None = None,
+                           report_email: str | None = None,
+                           basic_auth: str | None = None,
+                           timeout: int = 15):
+    """
+    Fetch WP status JSON and detect outdated core/plugins/themes.
+    Supports basic_auth="user:pass" (works with WP Application Passwords).
+    """
+    log.info(f"[task {self.request.id}] wp_outdated_fetch url={url} auth={bool(basic_auth)} headers={bool(headers)}")
     try:
         from modules.outdated_fetcher import fetch_outdated
-        result = fetch_outdated(url, headers)  # now auto-appends route + content-aware
+        result = fetch_outdated(url, headers=headers, timeout=timeout, basic_auth=basic_auth)
     except Exception as e:
         result = {"ok": False, "url": url, "error": str(e)}
 
+    if report_email:
+        try:
+            from emailer import send_report_email
+            send_report_email(report_email,
+                              f"[{settings.APP_NAME}] Outdated check for {url}",
+                              result or {})
+        except Exception as e:
+            result = {"_original": result, "_email_error": str(e)}
+
     return result
+
 
 @celery.task(bind=True, name="wp.update.plugins")
 def wp_update_plugins_task(self,

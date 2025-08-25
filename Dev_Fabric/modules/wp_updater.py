@@ -9,7 +9,7 @@ import time
 def _urls(base_url: str) -> Dict[str, str]:
     base = base_url.rstrip("/")
     return {
-        "status": f"{base}/wp-json/site/v1/status",
+        "status": f"{base}/wp-json/custom/v1/status",
         "plugins": f"{base}/wp-json/custom/v1/update-plugins",
         "core":    f"{base}/wp-json/custom/v1/update-core",
     }

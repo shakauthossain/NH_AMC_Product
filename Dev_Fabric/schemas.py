@@ -79,8 +79,11 @@ class DomainSSLCollectorRequest(BaseModel):
 
 class WPOutdatedFetchRequest(BaseModel):
     url: str
-    headers: Optional[Dict[str, str]] = None
+    headers: Optional[dict] = None
     report_email: Optional[str] = None
+    basic_auth: Optional[str] = None   # "user:pass"
+    timeout: Optional[int] = 15
+
 
 
 class BasicAuth(BaseModel):

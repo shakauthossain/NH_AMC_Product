@@ -190,9 +190,15 @@ def trigger_domain_ssl_collect(req: DomainSSLCollectorRequest):
     task = domain_ssl_collect_task.delay(domain=req.domain, report_email=req.report_email)
     return {"task_id": task.id, "status": "queued"}
 
-@app.post("/tasks/wp-outdated-fetch", response_model=TaskEnqueueResponse, summary="Fetch plugin/theme/core outdated status via WP REST")
+@app.post("/tasks/wp-outdated-fetch", response_model=TaskEnqueueResponse)
 def trigger_wp_outdated_fetch(req: WPOutdatedFetchRequest):
-    task = wp_outdated_fetch_task.delay(url=req.url, headers=req.headers, report_email=req.report_email)
+    task = wp_outdated_fetch_task.delay(
+        url=req.url,
+        headers=req.headers,
+        report_email=req.report_email,
+        basic_auth=req.basic_auth,
+        timeout=req.timeout or 15,
+    )
     return {"task_id": task.id, "status": "queued"}
 
 @app.post("/tasks/wp-update/plugins", response_model=TaskEnqueueResponse, summary="Update WP plugins via REST")
