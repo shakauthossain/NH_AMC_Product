@@ -14,6 +14,7 @@ import { Label } from "@/components/ui/label";
 import { useToast } from "@/hooks/use-toast";
 import { apiService } from "@/lib/api";
 import { PluginDebugPanel } from "@/components/ui/plugin-debug-panel";
+import { useTaskTracker } from "../layout/task-sidebar";
 import type { PluginInfo, NormalizationDebugInfo } from "@/lib/plugin-normalizer";
 import { 
   Shield, 
@@ -83,6 +84,7 @@ export function WPStatusPage() {
     taskResult?: any;
   }>({});
   const { toast } = useToast();
+  const { addTaskToTracker } = useTaskTracker();
 
   // Load saved connections
   const { data: savedConnections = [] } = useQuery({
@@ -170,42 +172,54 @@ export function WPStatusPage() {
   const { data: wpOutdatedStatus, refetch: refetchOutdated, isLoading: outdatedLoading } = useQuery({
     queryKey: ['wp-outdated', selectedSite],
     queryFn: async () => {
-// console.log('Starting WP Outdated check...');
-      // console.log("selectedSite", selectedSite);
-      // console.log("selectedConnection", selectedConnection);
       if (!selectedSite || !selectedConnection) return null;
       
-      const domain = selectedConnection.host
-      // ?.includes('.') 
-      //   ? selectedConnection.name 
-      //   : selectedConnection.host;
-// console.log("domain", domain);
-      // Try to construct a proper WP REST API URL
+      const domain = selectedConnection.host;
+      // Send site root URL only (not the full /wp-json/custom/v1/status path)
       const baseUrl = domain.startsWith('http') ? domain : `http://${domain}`;
-      // console.log("baseUrl", baseUrl);
-      const restUrl = `${baseUrl}/wp-json/custom/v1/status`;
-      // console.log("restUrl", restUrl);
       
       try {
-        const outdatedResponse = await apiService.wpOutdatedFetch(restUrl);
-// console.log("outdatedResponse", outdatedResponse);
+        const outdatedResponse = await apiService.wpOutdatedFetch(baseUrl);
         const result = await apiService.pollTask(outdatedResponse.task_id);
-        // console.log("WP Outdated task result:", result);
         
         if (result.state === 'SUCCESS' && result.result) {
-// console.log("WP Outdated data structure:", {
-            // plugins: result.result.raw.plugins,
-            // themes: result.result.raw.themes,
-            // core: result.result.raw.core
-          // });
+          const summary = result.result.summary || {};
+          const raw = result.result.raw || {};
+          
+          console.log("WP Outdated new data structure:", {
+            summary,
+            rawPluginsList: raw.plugins?.list,
+            rawThemesList: raw.themes?.list,
+            fullResult: result.result
+          });
+          
+          // Build arrays according to new schema
+          const pluginsAll = Array.isArray(raw.plugins?.list) ? raw.plugins.list : [];
+          const themesAll = Array.isArray(raw.themes?.list) ? raw.themes.list : [];
+          
+          const pluginsOutdated = Array.isArray(summary.plugins_outdated) 
+            ? summary.plugins_outdated 
+            : pluginsAll.filter((p: any) => p.has_update === true);
+            
+          const themesOutdated = Array.isArray(summary.themes_outdated)
+            ? summary.themes_outdated
+            : themesAll.filter((t: any) => t.has_update === true);
+          
           return {
-            plugins: result.result.raw.plugins || [],
-            themes: result.result.raw.themes || [],
-            core: result.result.raw.core || {}
+            pluginsAll,
+            themesAll,
+            pluginsOutdated,
+            themesOutdated,
+            core: {
+              current_version: summary.core_current,
+              latest_version: summary.core_latest,
+              update_available: summary.core_update_available
+            },
+            summary,
+            raw
           };
         }
         
-        // console.log("WP Outdated task failed or no result:", result);
         return null;
       } catch (error) {
         console.error('WP Outdated check failed:', error);
@@ -248,12 +262,10 @@ export function WPStatusPage() {
   };
 
   const handleBulkPluginUpdate = async () => {
-    if (!selectedConnection || !wpOutdatedStatus?.plugins) return;
+    if (!selectedConnection || !wpOutdatedStatus?.pluginsOutdated) return;
 
     // Get all plugins that have updates available
-    const outdatedPlugins = wpOutdatedStatus.plugins.filter((plugin: any) => 
-      plugin.updateAvailable || plugin.update_available
-    );
+    const outdatedPlugins = Array.isArray(wpOutdatedStatus.pluginsOutdated) ? wpOutdatedStatus.pluginsOutdated : [];
 
     if (outdatedPlugins.length === 0) {
       toast({
@@ -284,8 +296,8 @@ export function WPStatusPage() {
         ? selectedConnection.host 
         : `http://${selectedConnection.host}`;
 
-      // Get plugin files for bulk update
-      const pluginFiles = outdatedPlugins.map((plugin: any) => plugin.plugin_file);
+      // Get plugin files/names for bulk update - handle new schema  
+      const pluginFiles = outdatedPlugins.map((plugin: any) => plugin.file || plugin.plugin_file || plugin.slug || plugin.name);
 
       console.log('=== BULK PLUGIN UPDATE REQUEST ===');
       console.log('Plugins to update:', outdatedPlugins.map(p => p.name || p.slug));
@@ -386,73 +398,51 @@ export function WPStatusPage() {
       }
 
       if (itemType === 'plugin') {
-        // Find the plugin in the available plugins list to get its plugin_file
-        const targetPlugin = wpOutdatedStatus?.plugins?.find((p: any) => 
-          p.name === itemName || p.slug === itemName
-        );
+        const pluginName = name;
 
-        if (!targetPlugin) {
-          throw new Error(`Plugin "${itemName}" not found in available plugins`);
-        }
-
-        const pluginFile = targetPlugin.plugin_file;
-        
-        console.log('=== PLUGIN UPDATE REQUEST ===');
-        console.log('Plugin to update:', itemName);
-        console.log('Plugin file:', pluginFile);
+        console.log('=== PLUGIN UPDATE REQUEST (BY NAME) ===');
+        console.log('Plugin to update:', pluginName);
         console.log('Base URL:', baseUrl);
         console.log('Auth:', { username, password: password ? '[SET]' : '[NOT SET]' });
 
-        // Use the new polling method for proper verification
-        const updateResult = await apiService.updatePluginWithPolling(
+        // Enqueue update task with plugin name (not file)
+        const enqueueResponse = await apiService.updatePlugins(
           baseUrl,
-          pluginFile,
-          { username, password },
-          (status) => {
-            // Update toast to show progress
-            toast({
-              title: "Plugin Update",
-              description: status,
-            });
-          }
+          [pluginName],
+          false,
+          [],
+          undefined,
+          { username, password }
         );
 
-        console.log('=== PLUGIN UPDATE RESULT ===');
-        console.log('Success:', updateResult.success);
-        console.log('Updated:', updateResult.updated);
-        console.log('Message:', updateResult.message);
-        console.log('Details:', updateResult.details);
+        toast({
+          title: "Plugin update queued",
+          description: `Task ID: ${enqueueResponse.task_id}`,
+        });
 
-        // Show result toast
-        if (updateResult.success && updateResult.updated) {
+        // Track in Task Sidebar
+        addTaskToTracker(enqueueResponse.task_id, `Update Plugin: ${pluginName}`, `Updating ${pluginName} via WordPress API`);
+
+        // Poll for completion
+        const taskResult = await apiService.pollTaskWithTimeout(enqueueResponse.task_id);
+        const res = taskResult.result || {};
+        const ok = res.ok === true || res.status_code === 200;
+
+        if (taskResult.state === 'SUCCESS' && ok) {
           toast({
             title: "Plugin updated",
-            description: `${itemName} is now up to date.`,
-          });
-        } else if (updateResult.success && !updateResult.updated) {
-          toast({
-            title: "Plugin update failed",
-            description: `${itemName} did not update. ${updateResult.details || ''}`,
-            variant: "destructive",
+            description: `${pluginName} update complete`,
           });
         } else {
-          // Handle auth failures specifically
-          if (updateResult.details?.includes('401') || updateResult.details?.toLowerCase().includes('auth')) {
-            toast({
-              title: "Auth failed on WordPress",
-              description: "Check username/password in Settings.",
-              variant: "destructive",
-            });
-          } else {
-            toast({
-              title: "Plugin update failed",
-              description: updateResult.details || updateResult.message,
-              variant: "destructive",
-            });
-          }
+          const detail = res?.response?.status || taskResult.info || 'Update failed';
+          toast({
+            title: "Plugin update failed",
+            description: `${pluginName}: ${detail}`,
+            variant: "destructive",
+          });
         }
 
-        // Close dialog if it was open and refresh status
+        // Close any dialog if open and refresh status
         setIsUpdateDialogOpen(false);
         refetchOutdated();
 
@@ -634,13 +624,13 @@ export function WPStatusPage() {
                     </div>
                     <div className="flex justify-between items-center">
                       <span className="text-sm text-muted-foreground">Status:</span>
-                      {wpOutdatedStatus.core.update_available ? (
+                      {(wpOutdatedStatus.core.update_available ? (
                         <Badge variant="outline" className="bg-warning/10 text-warning border-warning">
-                          Update available
+                          Up to date
                         </Badge>
                       ) : (
                         <Badge variant="outline" className="bg-success/10 text-success border-success">
-                          Up to date
+                          Update available
                         </Badge>
                       )}
                     </div>
@@ -758,13 +748,13 @@ export function WPStatusPage() {
               <CardHeader>
                 <CardTitle className="flex items-center space-x-2">
                   <Zap className="w-5 h-5" />
-                  <span>Plugins & Themes</span>
-                  {wpOutdatedStatus && (
-                    <Badge variant="outline" className="ml-2">
-                      {(wpOutdatedStatus?.plugins || []).filter((p: any) => p.updateAvailable || p.update_available).length + 
-                       (wpOutdatedStatus?.themes || []).filter((t: any) => t.updateAvailable || t.update_available).length} updates available
-                    </Badge>
-                  )}
+                   <span>Plugins & Themes</span>
+                   {wpOutdatedStatus && (
+                     <Badge variant="outline" className="ml-2">
+                        {(Array.isArray(wpOutdatedStatus?.pluginsOutdated) ? wpOutdatedStatus.pluginsOutdated.length : 0) + 
+                         (Array.isArray(wpOutdatedStatus?.themesOutdated) ? wpOutdatedStatus.themesOutdated.length : 0)} updates available
+                     </Badge>
+                   )}
                   {outdatedLoading && (
                     <Badge variant="outline" className="ml-2 animate-pulse">
                       Checking...
@@ -782,11 +772,11 @@ export function WPStatusPage() {
                     <TabsTrigger value="themes">Themes</TabsTrigger>
                   </TabsList>
                   <div className="flex justify-end mb-4">
-                    <Button
-                      onClick={handleBulkPluginUpdate}
-                      disabled={isBulkUpdating || !wpOutdatedStatus?.plugins?.some((p: any) => p.updateAvailable || p.update_available)}
-                      className="h-9"
-                    >
+                     <Button
+                       onClick={handleBulkPluginUpdate}
+                       disabled={isBulkUpdating || !(Array.isArray(wpOutdatedStatus?.pluginsOutdated) && wpOutdatedStatus.pluginsOutdated.length > 0)}
+                       className="h-9"
+                     >
                       {isBulkUpdating ? (
                         <>
                           <RefreshCw className="w-4 h-4 mr-2 animate-spin" />
@@ -811,60 +801,63 @@ export function WPStatusPage() {
                            <div>Update Status</div>
                            <div>Actions</div>
                          </div>
-                         {((wpOutdatedStatus?.plugins || []) as any[]).map((plugin: any, index: number) => {
-                           const hasUpdate = plugin.updateAvailable || plugin.update_available;
-                           const pluginKey = `plugin-${plugin.name || plugin.slug}`;
-                           const isUpdating = updatingItems.has(pluginKey);
-                           
-                           return (
-                           <div key={index} className="grid grid-cols-6 gap-4 p-3 border rounded-lg items-center">
-                            <div className="font-medium">{plugin.name || plugin.slug}</div>
-                            <div>
-                              <Badge variant={(plugin.status || plugin.active) === 'Active' || plugin.active ? 'default' : 'secondary'}>
-                                {plugin.status || (plugin.active ? 'Active' : 'Inactive')}
-                              </Badge>
+                           {(Array.isArray(wpOutdatedStatus?.pluginsAll) ? wpOutdatedStatus.pluginsAll : []).map((plugin: any, index: number) => {
+                             // Check if this plugin has an update available
+                             const hasUpdate = wpOutdatedStatus.pluginsOutdated?.some((p: any) => 
+                               (p.name === plugin.name) || (p.slug === plugin.slug) || (p.file === plugin.file)
+                             ) || plugin.has_update === true;
+                             const pluginKey = `plugin-${plugin.name || plugin.slug}`;
+                             const isUpdating = updatingItems.has(pluginKey);
+                            
+                            return (
+                            <div key={index} className="grid grid-cols-6 gap-4 p-3 border rounded-lg items-center">
+                             <div className="font-medium">{plugin.name || plugin.slug}</div>
+                             <div>
+                               <Badge variant={plugin.active ? 'default' : 'secondary'}>
+                                 {plugin.active ? 'Active' : 'Inactive'}
+                               </Badge>
+                             </div>
+                             <div className="font-mono text-sm">{plugin.installed || plugin.current || 'N/A'}</div>
+                             <div className="font-mono text-sm">{plugin.available || plugin.latest || 'N/A'}</div>
+                              <div>
+                                {hasUpdate ? (
+                                  <Badge variant="outline" className="bg-warning/10 text-warning border-warning">
+                                    Update Available
+                                  </Badge>
+                                ) : (
+                                  <Badge variant="outline" className="bg-success/10 text-success border-success">
+                                    Up-to-date
+                                  </Badge>
+                                )}
+                              </div>
+                              <div>
+                                {hasUpdate && (
+                                   <Button
+                                     size="sm"
+                                     variant="outline"
+                                     onClick={() => openUpdateDialog(plugin.name || plugin.slug, 'plugin')}
+                                     disabled={isUpdating || isBulkUpdating}
+                                     className="h-8"
+                                   >
+                                    {isUpdating ? (
+                                      <>
+                                        <RefreshCw className="w-3 h-3 mr-1 animate-spin" />
+                                        Updating...
+                                      </>
+                                    ) : (
+                                      'Update'
+                                    )}
+                                  </Button>
+                                )}
+                              </div>
                             </div>
-                            <div className="font-mono text-sm">{plugin.currentVersion || plugin.current_version || plugin.version}</div>
-                            <div className="font-mono text-sm">{plugin.latestVersion || plugin.latest_version || plugin.new_version || 'N/A'}</div>
-                             <div>
-                               {hasUpdate ? (
-                                 <Badge variant="outline" className="bg-warning/10 text-warning border-warning">
-                                   Update Available
-                                 </Badge>
-                               ) : (
-                                 <Badge variant="outline" className="bg-success/10 text-success border-success">
-                                   Up-to-date
-                                 </Badge>
-                               )}
-                             </div>
-                             <div>
-                               {hasUpdate && (
-                                  <Button
-                                    size="sm"
-                                    variant="outline"
-                                    onClick={() => openUpdateDialog(plugin.name || plugin.slug, 'plugin')}
-                                    disabled={isUpdating || isBulkUpdating}
-                                    className="h-8"
-                                  >
-                                   {isUpdating ? (
-                                     <>
-                                       <RefreshCw className="w-3 h-3 mr-1 animate-spin" />
-                                       Updating...
-                                     </>
-                                   ) : (
-                                     'Update'
-                                   )}
-                                 </Button>
-                               )}
-                             </div>
+                             );
+                           })}
+                          {(!Array.isArray(wpOutdatedStatus?.pluginsAll) || wpOutdatedStatus.pluginsAll.length === 0) && (
+                           <div className="text-center py-4 text-muted-foreground">
+                             No plugin information available
                            </div>
-                            );
-                          })}
-                         {(wpOutdatedStatus?.plugins || []).length === 0 && (
-                          <div className="text-center py-4 text-muted-foreground">
-                            No plugin information available
-                          </div>
-                        )}
+                         )}
                       </div>
                     </ScrollArea>
                   </TabsContent>
@@ -880,60 +873,63 @@ export function WPStatusPage() {
                            <div>Update Status</div>
                            <div>Actions</div>
                          </div>
-                         {((wpOutdatedStatus?.themes || []) as any[]).map((theme: any, index: number) => {
-                           const hasUpdate = theme.updateAvailable || theme.update_available;
-                           const themeKey = `theme-${theme.name || theme.slug}`;
-                           const isUpdating = updatingItems.has(themeKey);
-                           
-                           return (
-                           <div key={index} className="grid grid-cols-6 gap-4 p-3 border rounded-lg items-center">
-                            <div className="font-medium">{theme.name || theme.slug}</div>
-                            <div>
-                              <Badge variant={(theme.status || theme.active) === 'Active' || theme.active ? 'default' : 'secondary'}>
-                                {theme.status || (theme.active ? 'Active' : 'Inactive')}
-                              </Badge>
+                           {(Array.isArray(wpOutdatedStatus?.themesAll) ? wpOutdatedStatus.themesAll : []).map((theme: any, index: number) => {
+                             // Check if this theme has an update available
+                             const hasUpdate = wpOutdatedStatus.themesOutdated?.some((t: any) => 
+                               (t.name === theme.name) || (t.slug === theme.slug) || (t.stylesheet === theme.stylesheet)
+                             ) || theme.has_update === true;
+                             const themeKey = `theme-${theme.name || theme.slug}`;
+                             const isUpdating = updatingItems.has(themeKey);
+                            
+                            return (
+                            <div key={index} className="grid grid-cols-6 gap-4 p-3 border rounded-lg items-center">
+                             <div className="font-medium">{theme.name || theme.slug}</div>
+                             <div>
+                               <Badge variant={theme.active ? 'default' : 'secondary'}>
+                                 {theme.active ? 'Active' : 'Inactive'}
+                               </Badge>
+                             </div>
+                             <div className="font-mono text-sm">{theme.installed || theme.current || 'N/A'}</div>
+                             <div className="font-mono text-sm">{theme.available || theme.latest || 'N/A'}</div>
+                              <div>
+                                {hasUpdate ? (
+                                  <Badge variant="outline" className="bg-warning/10 text-warning border-warning">
+                                    Update Available
+                                  </Badge>
+                                ) : (
+                                  <Badge variant="outline" className="bg-success/10 text-success border-success">
+                                    Up-to-date
+                                  </Badge>
+                                )}
+                              </div>
+                              <div>
+                                {hasUpdate && (
+                                  <Button
+                                    size="sm"
+                                    variant="outline"
+                                    onClick={() => openUpdateDialog(theme.name || theme.slug, 'theme')}
+                                    disabled={isUpdating}
+                                    className="h-8"
+                                  >
+                                    {isUpdating ? (
+                                      <>
+                                        <RefreshCw className="w-3 h-3 mr-1 animate-spin" />
+                                        Updating...
+                                      </>
+                                    ) : (
+                                      'Update'
+                                    )}
+                                  </Button>
+                                )}
+                              </div>
                             </div>
-                            <div className="font-mono text-sm">{theme.currentVersion || theme.current_version || theme.version}</div>
-                            <div className="font-mono text-sm">{theme.latestVersion || theme.latest_version || theme.new_version || 'N/A'}</div>
-                             <div>
-                               {hasUpdate ? (
-                                 <Badge variant="outline" className="bg-warning/10 text-warning border-warning">
-                                   Update Available
-                                 </Badge>
-                               ) : (
-                                 <Badge variant="outline" className="bg-success/10 text-success border-success">
-                                   Up-to-date
-                                 </Badge>
-                               )}
-                             </div>
-                             <div>
-                               {hasUpdate && (
-                                 <Button
-                                   size="sm"
-                                   variant="outline"
-                                   onClick={() => openUpdateDialog(theme.name || theme.slug, 'theme')}
-                                   disabled={isUpdating}
-                                   className="h-8"
-                                 >
-                                   {isUpdating ? (
-                                     <>
-                                       <RefreshCw className="w-3 h-3 mr-1 animate-spin" />
-                                       Updating...
-                                     </>
-                                   ) : (
-                                     'Update'
-                                   )}
-                                 </Button>
-                               )}
-                             </div>
+                             );
+                           })}
+                          {(!Array.isArray(wpOutdatedStatus?.themesAll) || wpOutdatedStatus.themesAll.length === 0) && (
+                           <div className="text-center py-4 text-muted-foreground">
+                             No theme information available
                            </div>
-                            );
-                          })}
-                         {(wpOutdatedStatus?.themes || []).length === 0 && (
-                          <div className="text-center py-4 text-muted-foreground">
-                            No theme information available
-                          </div>
-                        )}
+                         )}
                       </div>
                     </ScrollArea>
                   </TabsContent>

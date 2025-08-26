@@ -85,7 +85,6 @@ class WPOutdatedFetchRequest(BaseModel):
     timeout: Optional[int] = 15
 
 
-
 class BasicAuth(BaseModel):
     username: str
     password: str

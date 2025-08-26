@@ -256,12 +256,16 @@ class ApiService {
     });
   }
 
-  async wpOutdatedFetch(url: string, headers?: Record<string, string>, reportEmail?: string): Promise<TaskResponse> {
-    return this.postJson<TaskResponse>('/tasks/wp-outdated-fetch', {
-      url,
-      headers,
-      report_email: reportEmail,
-    });
+  async wpOutdatedFetch(url: string, reportEmail?: string): Promise<TaskResponse> {
+    const auth = this.settings.defaultAuth;
+    const body: any = { url };
+    if (auth?.username && auth?.password) {
+      body.basic_auth = `${auth.username}:${auth.password}`;
+    }
+    if (reportEmail) {
+      body.report_email = reportEmail;
+    }
+    return this.postJson<TaskResponse>('/tasks/wp-outdated-fetch', body);
   }
 
   async updatePlugins(

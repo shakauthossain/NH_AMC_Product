@@ -2,6 +2,7 @@
 from __future__ import annotations
 from typing import Dict, Any, List, Optional, Tuple
 import requests
+import json
 import time
 
 # ---------- URL helpers ----------
@@ -26,7 +27,92 @@ def _auth_or_headers(
         kw["headers"] = headers
     return kw
 
-# ---------- Status + selection ----------
+# ---------- Schema coercion & plugin list helpers ----------
+
+def _coerce_status_dict(status_like: Any) -> Dict[str, Any]:
+    """
+    Accept anything and return a dict that looks like the /status JSON body.
+    Handles:
+      - dict already at status shape
+      - dicts wrapped like {"result": {...}} or {"raw": {...}}
+      - string JSON bodies
+    Falls back to {}.
+    """
+    if isinstance(status_like, dict):
+        # Already status-like?
+        if "plugins" in status_like and "themes" in status_like:
+            return status_like
+        # Common wrappers
+        if "raw" in status_like and isinstance(status_like["raw"], dict):
+            return status_like["raw"]
+        if "result" in status_like and isinstance(status_like["result"], dict):
+            inner = status_like["result"]
+            if "raw" in inner and isinstance(inner["raw"], dict):
+                return inner["raw"]
+            if "plugins" in inner and "themes" in inner:
+                return inner
+        return status_like
+
+    if isinstance(status_like, str):
+        try:
+            parsed = json.loads(status_like.strip())
+            return _coerce_status_dict(parsed)
+        except Exception:
+            return {}
+
+    return {}
+
+def _plugins_list_from_status(status_json: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """
+    Returns a list of plugin dicts with unified keys:
+      - plugin_file
+      - slug
+      - name
+      - version
+      - latest_version
+      - update_available (bool)
+    Works for both legacy and new schema. Filters out non-dict rows.
+    """
+    status_json = _coerce_status_dict(status_json)
+    plugins_obj = (status_json or {}).get("plugins")
+
+    # Extract raw rows
+    if isinstance(plugins_obj, dict):
+        rows = plugins_obj.get("list") or []
+    elif isinstance(plugins_obj, list):
+        rows = plugins_obj
+    else:
+        rows = []
+
+    unified: List[Dict[str, Any]] = []
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        plugin_file = row.get("plugin_file") or row.get("file") or ""
+        slug = row.get("slug") or (plugin_file.split("/")[0] if plugin_file else "")
+        name = row.get("name") or slug or plugin_file
+
+        # Map version fields
+        current = row.get("version") or row.get("installed")
+        latest  = row.get("latest_version") or row.get("available")
+        has_up  = row.get("update_available")
+        if has_up is None and (current is not None and latest is not None):
+            try:
+                has_up = str(current) != str(latest)
+            except Exception:
+                has_up = False
+
+        unified.append({
+            "plugin_file": plugin_file,
+            "slug": slug,
+            "name": name,
+            "version": current,
+            "latest_version": latest,
+            "update_available": bool(has_up),
+        })
+    return unified
+
+# ---------- Status  selection ----------
 
 def fetch_status(
     base_url: str,
@@ -37,7 +123,16 @@ def fetch_status(
     u = _urls(base_url)["status"]
     r = requests.get(u, **_auth_or_headers(auth, headers, timeout=timeout))
     r.raise_for_status()
-    return r.json()
+    # Try robust JSON (sometimes servers add BOM/whitespace)
+    text = r.text or ""
+    try:
+        return r.json()
+    except Exception:
+        try:
+            return json.loads(text.lstrip("\ufeff").strip())
+        except Exception:
+            # Surface a readable preview if the endpoint didn't return JSON
+            return {"_non_json": True, "url": u, "status_code": r.status_code, "body_preview": text[:1000]}
 
 def select_outdated_plugins(
     status_json: Dict[str, Any],
@@ -46,9 +141,9 @@ def select_outdated_plugins(
     """
     Return plugin_file entries that have update_available=True, minus any blocklisted items.
     """
-    block = set(blocklist or [])
+    block = set((blocklist or []))
     result: List[str] = []
-    for p in status_json.get("plugins", []) or []:
+    for p in _plugins_list_from_status(_coerce_status_dict(status_json)):
         if p.get("update_available"):
             plugin_file = p.get("plugin_file")
             if plugin_file and plugin_file not in block:
@@ -57,12 +152,15 @@ def select_outdated_plugins(
 
 # ---------- Introspection helpers ----------
 
-def _plugin_versions_map(status_json: Dict[str, Any]) -> Dict[str, Dict[str, Optional[str]]]:
+def _plugin_versions_map(status_like: Any) -> Dict[str, Dict[str, Optional[str]]]:
     """
     Map plugin_file -> {current, latest}
+    Schema-agnostic: uses _plugins_list_from_status so it works with both legacy list
+    and new {"plugins":{"list":[...]}} shapes; also accepts JSON strings/wrappers.
     """
+    status = _coerce_status_dict(status_like)
     out: Dict[str, Dict[str, Optional[str]]] = {}
-    for p in (status_json.get("plugins") or []):
+    for p in _plugins_list_from_status(status):
         pf = p.get("plugin_file")
         if pf:
             out[pf] = {"current": p.get("version"), "latest": p.get("latest_version")}
@@ -123,12 +221,12 @@ def update_plugins(
 
     # Snapshot BEFORE to verify later
     try:
-        before = fetch_status(base_url, auth, headers, timeout=30)
+        before_raw = fetch_status(base_url, auth, headers, timeout=30)
     except Exception as e:
         return {"ok": False, "url": base_url, "error": f"Status (before) fetch failed: {e}"}
-    before_map = _plugin_versions_map(before)
+    before_map = _plugin_versions_map(before_raw)
 
-    # Decide mode explicitly (optional but helpful)
+    # Decide mode explicitly
     mode = "single" if len(plugins) == 1 else "bulk"
 
     def _post_form(plugs: List[str]) -> requests.Response:
@@ -153,7 +251,7 @@ def update_plugins(
     per_plugin: List[Dict[str, Any]] = []
     last_ok = False
 
-    # 1) Try batch FORM first (best match for your PHP)
+    # 1) Try batch FORM first (best match for many WP handlers)
     try:
         r = _post_form(plugins)
         attempts.append({"mode": "batch_form", "status": r.status_code, "ok": r.ok, "body": (r.text or "")[:800]})
@@ -176,14 +274,13 @@ def update_plugins(
 
     # Check which plugins still look stale after batch
     try:
-        after_batch = fetch_status(base_url, auth, headers, timeout=30)
-        after_batch_map = _plugin_versions_map(after_batch)
+        after_batch_raw = fetch_status(base_url, auth, headers, timeout=30)
+        after_batch_map = _plugin_versions_map(after_batch_raw)
     except Exception:
-        after_batch = None
+        after_batch_raw = None
         after_batch_map = {}
 
     def _is_up_to_date(pf: str) -> bool:
-        """Consider success if version didn't change but after.current == after.latest."""
         return _looks_updated(before_map, after_batch_map, pf)
 
     needs_fix = []
@@ -224,8 +321,8 @@ def update_plugins(
 
             time.sleep(settle_secs)
             try:
-                post = fetch_status(base_url, auth, headers, timeout=30)
-                post_map = _plugin_versions_map(post)
+                post_raw = fetch_status(base_url, auth, headers, timeout=30)
+                post_map = _plugin_versions_map(post_raw)
                 updated = _looks_updated(before_map, post_map, pf)
             except Exception:
                 updated = False
@@ -253,7 +350,7 @@ def update_plugins(
             "per_plugin": per_plugin,
         }
     }
-    if after_batch:
-        result["post_status"] = after_batch
+    if "after_batch_raw" in locals() and after_batch_raw is not None:
+        result["post_status"] = after_batch_raw
 
     return result
