@@ -182,7 +182,17 @@ class ApiService {
   }
 
   async createBackup(config: SiteConfig): Promise<TaskResponse> {
-    return this.postJson<TaskResponse>('/tasks/backup', config);
+    // Legacy format for full backup
+    const payload = {
+      host: config.host,
+      user: config.user,
+      password: config.password,
+      wp_path: config.wp_path,
+      db_name: config.db_name,
+      db_user: config.db_user,
+      db_pass: config.db_pass,
+    };
+    return this.postJson<TaskResponse>('/tasks/backup', payload);
   }
 
   async getWpStatus(config: SiteConfig): Promise<TaskResponse> {
@@ -472,7 +482,24 @@ class ApiService {
       wait_timeout?: number;
     }
   ): Promise<TaskResponse | { downloaded: boolean; filename: string }> {
-    return this.postJson('/tasks/backup/db', config);
+    const payload = {
+      site: {
+        host: config.host,
+        user: config.user,
+        password: config.password,
+        wp_path: config.wp_path,
+        db_name: config.db_name,
+        db_user: config.db_user,
+        db_pass: config.db_pass,
+      },
+      req: {
+        out_dir: config.out_dir || "/tmp/backups",
+        download: config.download || false,
+        wait_timeout: config.wait_timeout || 600,
+        filename: config.filename || "database-backup.zip",
+      },
+    };
+    return this.postJson('/tasks/backup/db', payload);
   }
 
   async backupContent(
@@ -483,7 +510,24 @@ class ApiService {
       wait_timeout?: number;
     }
   ): Promise<TaskResponse | { downloaded: boolean; filename: string }> {
-    return this.postJson('/tasks/backup/content', config);
+    const payload = {
+      site: {
+        host: config.host,
+        user: config.user,
+        password: config.password,
+        wp_path: config.wp_path,
+        db_name: config.db_name,
+        db_user: config.db_user,
+        db_pass: config.db_pass,
+      },
+      req: {
+        out_dir: config.out_dir || "/tmp/backups",
+        download: config.download || false,
+        wait_timeout: config.wait_timeout || 600,
+        filename: config.filename || "wp-content.zip",
+      },
+    };
+    return this.postJson('/tasks/backup/content', payload);
   }
 
   // Task polling helper

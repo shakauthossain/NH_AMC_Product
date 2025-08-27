@@ -1,4 +1,4 @@
-from fastapi import FastAPI, HTTPException, Header, Depends, Request, BackgroundTasks
+from fastapi import FastAPI, HTTPException, Header, Depends, Request, BackgroundTasks, Body
 from fastapi.responses import JSONResponse, FileResponse
 from fastapi.middleware.cors import CORSMiddleware
 from celery.result import AsyncResult
@@ -240,7 +240,11 @@ def trigger_wp_update_all(req: WPUpdateAllRequest):
     return {"task_id": task.id, "status": "queued"}
 
 @app.post("/tasks/backup/db")   # remove response_model so we can return FileResponse
-def trigger_backup_db(req: BackupDbRequest, site: SiteConfig, background_tasks: BackgroundTasks):
+def trigger_backup_db(
+    req: BackupDbRequest = Body(embed=True),
+    site: SiteConfig = Body(embed=True),
+    background_tasks: BackgroundTasks = None
+):
     site.user = "root"
     task = run_site_task.delay(
         site.dict(), "backup_db",
@@ -286,7 +290,10 @@ def trigger_backup_db(req: BackupDbRequest, site: SiteConfig, background_tasks: 
 
 
 @app.post("/tasks/backup/content")  # remove response_model so we can return FileResponse
-def trigger_backup_content(req: BackupContentRequest, site: SiteConfig, background_tasks: BackgroundTasks):
+def trigger_backup_content(req: BackupDbRequest = Body(embed=True),
+    site: SiteConfig = Body(embed=True),
+    background_tasks: BackgroundTasks = None
+):
     site.user = "root"
     task = run_site_task.delay(
         site.dict(), "backup_wp_content",

@@ -65,10 +65,16 @@ export function OperationsPage() {
     reportEmail: "",
   });
 
-  const [backupConfig, setBackupConfig] = useState({
+  const [dbBackupConfig, setDbBackupConfig] = useState({
     download: false,
     outDir: "/tmp/backups",
-    filename: "",
+    filename: "backup.sql.gz",
+  });
+
+  const [contentBackupConfig, setContentBackupConfig] = useState({
+    download: false,
+    outDir: "/tmp/backups",
+    filename: "content-backup.tar.gz",
   });
 
   const { toast } = useToast();
@@ -114,7 +120,22 @@ export function OperationsPage() {
   });
 
   const backupMutation = useMutation({
-    mutationFn: () => apiService.createBackup(siteConfig),
+    mutationFn: async () => {
+      const response = await apiService.createBackup(siteConfig);
+      // Poll for completion and show success popup
+      const result = await apiService.pollTaskWithTimeout(response.task_id, {
+        onUpdate: (status) => {
+          if (status.state === 'SUCCESS') {
+            // Show success dialog with directory path
+            toast({
+              title: "Full Backup Completed",
+              description: `Backup stored in: /tmp/backups`,
+            });
+          }
+        }
+      });
+      return { ...response, result };
+    },
     onSuccess: (data) => {
       toast({
         title: "Backup queued",
@@ -125,7 +146,7 @@ export function OperationsPage() {
   });
 
   const backupDbMutation = useMutation({
-    mutationFn: () => apiService.backupDb({ ...siteConfig, ...backupConfig }),
+    mutationFn: () => apiService.backupDb({ ...siteConfig, ...dbBackupConfig }),
     onSuccess: (data) => {
       if ('downloaded' in data) {
         toast({
@@ -143,7 +164,7 @@ export function OperationsPage() {
   });
 
   const backupContentMutation = useMutation({
-    mutationFn: () => apiService.backupContent({ ...siteConfig, ...backupConfig }),
+    mutationFn: () => apiService.backupContent({ ...siteConfig, ...contentBackupConfig }),
     onSuccess: (data) => {
       if ('downloaded' in data) {
         toast({
@@ -363,8 +384,8 @@ export function OperationsPage() {
               <CardContent className="space-y-4">
                 <div className="flex items-center space-x-2">
                   <Switch
-                    checked={backupConfig.download}
-                    onCheckedChange={(checked) => setBackupConfig({ ...backupConfig, download: checked })}
+                    checked={dbBackupConfig.download}
+                    onCheckedChange={(checked) => setDbBackupConfig({ ...dbBackupConfig, download: checked })}
                   />
                   <Label>Download immediately</Label>
                 </div>
@@ -388,8 +409,8 @@ export function OperationsPage() {
               <CardContent className="space-y-4">
                 <div className="flex items-center space-x-2">
                   <Switch
-                    checked={backupConfig.download}
-                    onCheckedChange={(checked) => setBackupConfig({ ...backupConfig, download: checked })}
+                    checked={contentBackupConfig.download}
+                    onCheckedChange={(checked) => setContentBackupConfig({ ...contentBackupConfig, download: checked })}
                   />
                   <Label>Download immediately</Label>
                 </div>

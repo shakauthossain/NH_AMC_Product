@@ -14,6 +14,7 @@ import { Label } from "@/components/ui/label";
 import { useToast } from "@/hooks/use-toast";
 import { apiService } from "@/lib/api";
 import { PluginDebugPanel } from "@/components/ui/plugin-debug-panel";
+import { WpAdminDialog } from "@/components/ui/wp-admin-dialog";
 import { useTaskTracker } from "../layout/task-sidebar";
 import type { PluginInfo, NormalizationDebugInfo } from "@/lib/plugin-normalizer";
 import { 
@@ -83,6 +84,7 @@ export function WPStatusPage() {
     attempts?: any[];
     taskResult?: any;
   }>({});
+  const [showWpAdminDialog, setShowWpAdminDialog] = useState(false);
   const { toast } = useToast();
   const { addTaskToTracker } = useTaskTracker();
 
@@ -96,6 +98,28 @@ export function WPStatusPage() {
   });
 
   const selectedConnection = savedConnections.find((conn: any) => conn.id === selectedSite);
+
+  // Show WordPress admin credentials dialog on first visit after SSH connection
+  useEffect(() => {
+    const checkWpAdminDialog = () => {
+      // Only show if we have a selected site (SSH connection made)
+      if (!selectedSite) return;
+
+      // Check if dialog has been shown before
+      const dialogShown = localStorage.getItem('wp-admin-dialog-shown');
+      if (dialogShown) return;
+
+      // Check if we already have default auth credentials
+      const currentSettings = apiService.getSettings();
+      const hasCredentials = currentSettings.defaultAuth?.username && currentSettings.defaultAuth?.password;
+      if (hasCredentials) return;
+
+      // Show the dialog
+      setShowWpAdminDialog(true);
+    };
+
+    checkWpAdminDialog();
+  }, [selectedSite]);
 
 
   const { data: sslStatus, refetch: refetchSSL, isLoading: sslLoading } = useQuery({
@@ -624,13 +648,14 @@ export function WPStatusPage() {
                     </div>
                     <div className="flex justify-between items-center">
                       <span className="text-sm text-muted-foreground">Status:</span>
-                      {(wpOutdatedStatus.core.update_available ? (
+                      {(wpOutdatedStatus.core.update_available && 
+                        wpOutdatedStatus.core.current_version !== wpOutdatedStatus.core.latest_version) ? (
                         <Badge variant="outline" className="bg-warning/10 text-warning border-warning">
-                          Up to date
+                          Update available
                         </Badge>
                       ) : (
                         <Badge variant="outline" className="bg-success/10 text-success border-success">
-                          Update available
+                          Up to date
                         </Badge>
                       )}
                     </div>
@@ -1012,6 +1037,12 @@ export function WPStatusPage() {
           </div>
         </DialogContent>
       </Dialog>
+
+      {/* WordPress Admin Credentials Dialog */}
+      <WpAdminDialog 
+        open={showWpAdminDialog} 
+        onOpenChange={setShowWpAdminDialog}
+      />
     </div>
   );
 }
