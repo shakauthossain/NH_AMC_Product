@@ -1,0 +1,33 @@
+version: "3.9"
+services:
+  redis:
+    image: redis:7-alpine
+    ports: ["6379:6379"]
+
+  api:
+    build: .
+    environment:
+      PORT: "8000"
+      HOST: "0.0.0.0"
+      PYTHONUNBUFFERED: "1"
+      PYTHONPATH: "/app"
+      REDIS_URL: "redis://redis:6379/0"
+      BROKER_URL: "redis://redis:6379/0"
+      RESULT_BACKEND: "redis://redis:6379/0"
+      CORS_ALLOW_ORIGINS: "*"
+      RESET_SECRET: "dev-secret"
+    depends_on: [redis]
+    ports: ["8000:8000"]
+
+  celery:
+    build: .
+    environment:
+      PYTHONUNBUFFERED: "1"
+      PYTHONPATH: "/app"
+      REDIS_URL: "redis://redis:6379/0"
+      BROKER_URL: "redis://redis:6379/0"
+      RESULT_BACKEND: "redis://redis:6379/0"
+      CORS_ALLOW_ORIGINS: "*"
+      RESET_SECRET: "dev-secret"
+    depends_on: [redis]
+    command: ["/usr/local/bin/celery","-A","celery_app","worker","-l","info","--pool=solo"]

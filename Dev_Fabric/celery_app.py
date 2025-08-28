@@ -7,7 +7,10 @@ from datetime import datetime, timezone
 import json
 from typing import Any, Dict, List, Optional
 
-celery = Celery(__name__, broker=str(settings.BROKER_URL), backend=str(settings.RESULT_BACKEND))
+_broker  = settings.BROKER_URL or settings.REDIS_URL
+_backend = settings.RESULT_BACKEND or settings.REDIS_URL
+
+celery = Celery(__name__, broker=str(_broker), backend=str(_backend))
 log = get_logger("worker")
 
 
