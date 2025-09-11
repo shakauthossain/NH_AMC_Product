@@ -86,7 +86,7 @@ class ApiService {
       return JSON.parse(saved);
     }
     return {
-      baseUrl: 'http://localhost:8000',
+      baseUrl: 'https://amcbackend.hellonotionhive.com',
     };
   }
 
