@@ -1,6 +1,7 @@
 // API Service Layer for WordPress Management Dashboard
 
 import { normalizePluginList, type PluginInfo, type NormalizationDebugInfo } from './plugin-normalizer';
+import { config } from './config';
 
 export interface SiteConnection {
   host: string;
@@ -86,7 +87,7 @@ class ApiService {
       return JSON.parse(saved);
     }
     return {
-      baseUrl: 'https://amcbackend.hellonotionhive.com',
+      baseUrl: config.apiBaseUrl,
     };
   }
 

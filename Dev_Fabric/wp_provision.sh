@@ -23,7 +23,7 @@ WP_VERSION="${11:-latest}"
 REPORT_PATH="${12:-/tmp/wp_provision_report.json}"
 LETSENCRYPT_EMAIL="${13:-}"         # used only if DOMAIN set
 NONINTERACTIVE="${14:-true}"        # "true" or "false"
-LOCALE="en_US"                      # always force English
+LOCALE="${15:-en_US}"               # WordPress language locale
 
 # -------------------- Basics --------------------
 log()  { echo -e "\033[1;32m==>\033[0m $*"; }
@@ -125,7 +125,14 @@ wp_bin="/usr/local/bin/wp"
 wp(){ su -s /bin/bash - www-data -c "cd '$WP_PATH' && $wp_bin $*"; }
 
 # New: always pass explicit --path and run as www-data
-wp_run(){ su -s /bin/bash - www-data -c "$wp_bin --allow-root --path='$WP_PATH' $*"; }
+wp_run(){ 
+  # Build command with proper quoting for arguments with spaces
+  local cmd="$wp_bin --allow-root --path='$WP_PATH'"
+  for arg in "$@"; do
+    cmd="$cmd $(printf '%q' "$arg")"
+  done
+  su -s /bin/bash - www-data -c "$cmd"
+}
 
 ensure_wpcli(){
   if command -v "$wp_bin" >/dev/null 2>&1; then return 0; fi
@@ -134,19 +141,346 @@ ensure_wpcli(){
   return 0
 }
 
+configure_php_fpm_timeouts(){
+  local PHP_VER="$1"
+  log "Configuring PHP-FPM timeouts and limits for plugin updates..."
+  
+  local PHP_INI="/etc/php/${PHP_VER}/fpm/php.ini"
+  local FPM_POOL="/etc/php/${PHP_VER}/fpm/pool.d/www.conf"
+  
+  # Update PHP.ini settings
+  if [[ -f "$PHP_INI" ]]; then
+    # Backup original
+    cp "$PHP_INI" "${PHP_INI}.backup" 2>/dev/null || true
+    
+    # Update or add settings
+    sed -i 's/^max_execution_time = .*/max_execution_time = 300/' "$PHP_INI"
+    sed -i 's/^memory_limit = .*/memory_limit = 512M/' "$PHP_INI"
+    sed -i 's/^max_input_time = .*/max_input_time = 300/' "$PHP_INI"
+    sed -i 's/^post_max_size = .*/post_max_size = 128M/' "$PHP_INI"
+    sed -i 's/^upload_max_filesize = .*/upload_max_filesize = 128M/' "$PHP_INI"
+    
+    # Add if not present
+    grep -q "^max_execution_time" "$PHP_INI" || echo "max_execution_time = 300" >> "$PHP_INI"
+    grep -q "^memory_limit" "$PHP_INI" || echo "memory_limit = 512M" >> "$PHP_INI"
+    grep -q "^max_input_time" "$PHP_INI" || echo "max_input_time = 300" >> "$PHP_INI"
+  fi
+  
+  # Update FPM pool configuration
+  if [[ -f "$FPM_POOL" ]]; then
+    # Backup original
+    cp "$FPM_POOL" "${FPM_POOL}.backup" 2>/dev/null || true
+    
+    # Add or update pool settings
+    grep -q "^request_terminate_timeout" "$FPM_POOL" || echo "request_terminate_timeout = 300s" >> "$FPM_POOL"
+    grep -q "^pm.max_requests" "$FPM_POOL" || echo "pm.max_requests = 500" >> "$FPM_POOL"
+    sed -i 's/^request_terminate_timeout = .*/request_terminate_timeout = 300s/' "$FPM_POOL"
+  fi
+  
+  log "PHP-FPM timeout configuration completed"
+}
+
+configure_nginx_timeouts(){
+  log "Configuring Nginx timeouts for plugin updates..."
+  
+  local NGINX_CONF="/etc/nginx/nginx.conf"
+  local SITE_CONF="/etc/nginx/sites-available/default"
+  
+  # Update main nginx.conf
+  if [[ -f "$NGINX_CONF" ]]; then
+    # Backup original
+    cp "$NGINX_CONF" "${NGINX_CONF}.backup" 2>/dev/null || true
+    
+    # Add timeout settings to http block if not present
+    if ! grep -q "proxy_read_timeout" "$NGINX_CONF"; then
+      sed -i '/http {/a\    proxy_read_timeout 300s;\n    proxy_connect_timeout 300s;\n    fastcgi_read_timeout 300s;\n    fastcgi_send_timeout 300s;\n    fastcgi_connect_timeout 300s;' "$NGINX_CONF"
+    fi
+  fi
+  
+  # Update site-specific config
+  if [[ -f "$SITE_CONF" ]]; then
+    # Backup original
+    cp "$SITE_CONF" "${SITE_CONF}.backup" 2>/dev/null || true
+    
+    # Add PHP location block with timeouts if not present
+    if ! grep -q "fastcgi_read_timeout" "$SITE_CONF"; then
+      # Find PHP location block and add timeouts
+      sed -i '/location ~ \.php\$ {/a\        fastcgi_read_timeout 300s;\n        fastcgi_send_timeout 300s;\n        fastcgi_connect_timeout 300s;' "$SITE_CONF"
+    fi
+  fi
+  
+  # Test nginx configuration
+  if nginx -t >/dev/null 2>&1; then
+    log "Nginx timeout configuration completed successfully"
+  else
+    warn "Nginx configuration test failed, restoring backup"
+    [[ -f "${NGINX_CONF}.backup" ]] && cp "${NGINX_CONF}.backup" "$NGINX_CONF" 2>/dev/null || true
+    [[ -f "${SITE_CONF}.backup" ]] && cp "${SITE_CONF}.backup" "$SITE_CONF" 2>/dev/null || true
+  fi
+}
+
+configure_wp_config_constants(){
+  log "Adding WordPress configuration constants to wp-config.php..."
+  
+  local WP_CONFIG="${WP_PATH}/wp-config.php"
+  
+  if [[ ! -f "$WP_CONFIG" ]]; then
+    warn "wp-config.php not found at $WP_CONFIG"
+    return 1
+  fi
+  
+  # Backup original wp-config.php
+  cp "$WP_CONFIG" "${WP_CONFIG}.backup" 2>/dev/null || true
+  
+  # Define the constants to add
+  local CONSTANTS="
+/* Custom WordPress Constants - Added by Provisioner */
+define('REST_AUTHORIZATION_HEADER', true);
+define('FS_METHOD', 'direct');
+define('WP_MEMORY_LIMIT', '512M');
+define('DISALLOW_FILE_MODS', false);
+define('WP_MAX_MEMORY_LIMIT', '512M');
+/* End Custom Constants */
+"
+  
+  # Check if constants already exist to avoid duplicates
+  if ! grep -q "REST_AUTHORIZATION_HEADER" "$WP_CONFIG"; then
+    # Insert constants before the "/* That's all, stop editing!" line
+    if grep -q "That's all, stop editing" "$WP_CONFIG"; then
+      # Insert before the stop editing line
+      sed -i "/\/\* That's all, stop editing/i\\$CONSTANTS" "$WP_CONFIG"
+    else
+      # If the standard line doesn't exist, append before the closing PHP tag or at the end
+      if grep -q "?>" "$WP_CONFIG"; then
+        sed -i "/<?>/i\\$CONSTANTS" "$WP_CONFIG"
+      else
+        echo "$CONSTANTS" >> "$WP_CONFIG"
+      fi
+    fi
+    
+    log "WordPress configuration constants added successfully"
+  else
+    log "WordPress configuration constants already exist, skipping..."
+  fi
+  
+  # Verify the file is still valid PHP
+  if php -l "$WP_CONFIG" >/dev/null 2>&1; then
+    log "wp-config.php syntax validation passed"
+    return 0
+  else
+    warn "wp-config.php syntax error detected, restoring backup"
+    cp "${WP_CONFIG}.backup" "$WP_CONFIG" 2>/dev/null || true
+    return 1
+  fi
+}
+
+configure_wp_language(){
+  log "Configuring WordPress language to ${LOCALE}..."
+  
+  local WP_LANG_CODE
+  case "$LOCALE" in
+    "en_US") WP_LANG_CODE="en_US" ;;
+    "es_ES") WP_LANG_CODE="es_ES" ;;
+    "fr_FR") WP_LANG_CODE="fr_FR" ;;
+    "de_DE") WP_LANG_CODE="de_DE" ;;
+    "it_IT") WP_LANG_CODE="it_IT" ;;
+    "pt_BR") WP_LANG_CODE="pt_BR" ;;
+    "ja")    WP_LANG_CODE="ja" ;;
+    "zh_CN") WP_LANG_CODE="zh_CN" ;;
+    *) 
+      log "Using default English (en_US) locale"
+      WP_LANG_CODE="en_US"
+      ;;
+  esac
+  
+  if [[ "$WP_LANG_CODE" != "en_US" ]]; then
+    # Download and install language pack
+    if wp_run language core install "$WP_LANG_CODE" >/dev/null 2>&1; then
+      log "Language pack $WP_LANG_CODE downloaded successfully"
+      
+      # Activate the language
+      if wp_run language core activate "$WP_LANG_CODE" >/dev/null 2>&1; then
+        log "WordPress language set to $WP_LANG_CODE"
+      else
+        warn "Failed to activate language $WP_LANG_CODE, keeping English"
+      fi
+    else
+      warn "Failed to download language pack $WP_LANG_CODE, keeping English"
+    fi
+  else
+    log "WordPress language already set to English (en_US)"
+  fi
+  
+  # Verify current language
+  local CURRENT_LANG
+  CURRENT_LANG=$(wp_run option get WPLANG 2>/dev/null || echo "en_US")
+  log "Current WordPress language: ${CURRENT_LANG:-en_US}"
+}
+
+install_plugin_from_github(){
+  local repo_url="$1"
+  local plugin_name="$2"
+  local branch="${3:-main}"
+  
+  log "Installing plugin '$plugin_name' from GitHub: $repo_url"
+  
+  local temp_dir="/tmp/github_plugin_$plugin_name"
+  local plugins_dir="${WP_PATH}/wp-content/plugins"
+  
+  # Clean up any existing temp directory
+  rm -rf "$temp_dir" 2>/dev/null || true
+  
+  # Clone the repository
+  if git clone -b "$branch" --depth 1 "$repo_url" "$temp_dir" >/dev/null 2>&1; then
+    log "Successfully cloned GitHub repository"
+    
+    # Move plugin to WordPress plugins directory
+    if [[ -d "$temp_dir" ]]; then
+      # Remove .git directory to clean up
+      rm -rf "$temp_dir/.git" 2>/dev/null || true
+      
+      # Move to plugins directory
+      if mv "$temp_dir" "$plugins_dir/$plugin_name" 2>/dev/null; then
+        log "Plugin '$plugin_name' installed successfully from GitHub"
+        
+        # Set proper permissions
+        chown -R www-data:www-data "$plugins_dir/$plugin_name" 2>/dev/null || true
+        chmod -R 755 "$plugins_dir/$plugin_name" 2>/dev/null || true
+        
+        # Activate plugin
+        wp_run plugin activate "$plugin_name" >/dev/null 2>&1 && log "Plugin '$plugin_name' activated" || warn "Failed to activate plugin '$plugin_name'"
+        
+        return 0
+      else
+        warn "Failed to move plugin '$plugin_name' to plugins directory"
+      fi
+    fi
+  else
+    warn "Failed to clone GitHub repository: $repo_url"
+  fi
+  
+  # Clean up temp directory
+  rm -rf "$temp_dir" 2>/dev/null || true
+  return 1
+}
+
+install_plugin_from_local(){
+  local local_plugin_path="$1"
+  local plugin_name="$2"
+  
+  log "Installing local plugin '$plugin_name' from: $local_plugin_path"
+  
+  local plugins_dir="${WP_PATH}/wp-content/plugins"
+  local target_dir="$plugins_dir/$plugin_name"
+  
+  # Check if local plugin path exists
+  if [[ ! -d "$local_plugin_path" && ! -f "$local_plugin_path" ]]; then
+    warn "Local plugin path does not exist: $local_plugin_path"
+    return 1
+  fi
+  
+  # Handle zip files
+  if [[ "$local_plugin_path" == *.zip ]]; then
+    log "Extracting ZIP plugin: $local_plugin_path"
+    local temp_dir="/tmp/local_plugin_$plugin_name"
+    rm -rf "$temp_dir" 2>/dev/null || true
+    mkdir -p "$temp_dir"
+    
+    if unzip -q "$local_plugin_path" -d "$temp_dir" 2>/dev/null; then
+      # Find the main plugin directory (usually the first directory in zip)
+      local extracted_dir=$(find "$temp_dir" -mindepth 1 -maxdepth 1 -type d | head -1)
+      if [[ -n "$extracted_dir" ]]; then
+        if mv "$extracted_dir" "$target_dir" 2>/dev/null; then
+          log "Local ZIP plugin '$plugin_name' installed successfully"
+        else
+          warn "Failed to move extracted plugin to plugins directory"
+          rm -rf "$temp_dir" 2>/dev/null || true
+          return 1
+        fi
+      else
+        warn "No plugin directory found in ZIP file"
+        rm -rf "$temp_dir" 2>/dev/null || true
+        return 1
+      fi
+    else
+      warn "Failed to extract ZIP file: $local_plugin_path"
+      rm -rf "$temp_dir" 2>/dev/null || true
+      return 1
+    fi
+    rm -rf "$temp_dir" 2>/dev/null || true
+  else
+    # Handle directory
+    if cp -r "$local_plugin_path" "$target_dir" 2>/dev/null; then
+      log "Local plugin '$plugin_name' copied successfully"
+    else
+      warn "Failed to copy local plugin directory"
+      return 1
+    fi
+  fi
+  
+  # Set proper permissions
+  chown -R www-data:www-data "$target_dir" 2>/dev/null || true
+  chmod -R 755 "$target_dir" 2>/dev/null || true
+  
+  # Activate plugin
+  wp_run plugin activate "$plugin_name" >/dev/null 2>&1 && log "Plugin '$plugin_name' activated" || warn "Failed to activate plugin '$plugin_name'"
+  
+  return 0
+}
+
+install_custom_plugins(){
+  log "Installing custom plugins..."
+  
+  # Install Basic Auth plugin from GitHub (WP-API repository)
+  install_plugin_from_github "https://github.com/WP-API/Basic-Auth.git" "basic-auth" "master"
+  
+  # Install remote-plugins-updater from your GitHub repository
+  install_plugin_from_github "https://github.com/shakauthossain/remote-plugins-updater.git" "remote-plugins-updater" "main"
+  
+  log "Custom plugin installation completed"
+}
+
 wp_core_install_with_retries(){
-  local url="$1" title="$2" user="$3" pass="$4" email="$5"
+  local url="$1" title="$2" user="$3" pass="$4" email="$5" locale="$6"
   local tries=3 i=1
   while :; do
-    if wp_run core is-installed >/dev/null 2>&1; then return 0; fi
-    if wp_run core install --skip-email \
-       --url="$url" --title="$title" \
-       --admin_user="$user" --admin_password="$pass" --admin_email="$email" \
-       >/tmp/.wp_install.log 2>&1; then
+    if wp_run core is-installed >/dev/null 2>&1; then 
+      log "WordPress installation verified successfully"
       return 0
     fi
+    
+    log "Attempting WordPress installation (attempt $i/$tries)..."
+    # Use array to properly handle arguments with spaces
+    local wp_install_args=(
+      "core" "install" "--skip-email"
+      "--url=$url"
+      "--title=$title"
+      "--admin_user=$user"
+      "--admin_password=$pass"
+      "--admin_email=$email"
+      "--locale=$locale"
+    )
+    if wp_run "${wp_install_args[@]}" >/tmp/.wp_install_${i}.log 2>&1; then
+      log "WordPress core install command completed"
+      # Verify installation worked
+      if wp_run core is-installed >/dev/null 2>&1; then
+        log "WordPress installation verification successful"
+        return 0
+      else
+        warn "WordPress install command succeeded but verification failed (attempt $i)"
+      fi
+    else
+      warn "WordPress install command failed (attempt $i), see /tmp/.wp_install_${i}.log"
+      cat /tmp/.wp_install_${i}.log || true
+    fi
+    
     if [ $i -ge $tries ]; then
-      wp_run core is-installed >/dev/null 2>&1 && return 0
+      warn "WordPress installation failed after $tries attempts"
+      # Final verification attempt
+      if wp_run core is-installed >/dev/null 2>&1; then
+        log "Final verification: WordPress is actually installed"
+        return 0
+      fi
       return 1
     fi
     sleep 5
@@ -259,6 +593,15 @@ else
   apt_update_resilient
   if install_php_any; then
     php_ini_tune
+    # Configure PHP-FPM and Nginx timeouts for plugin updates
+    if [[ -n "$PHP_EFF_VER" ]]; then
+      configure_php_fpm_timeouts "$PHP_EFF_VER"
+      configure_nginx_timeouts
+      # Restart services to apply new configurations
+      safe systemctl restart "php${PHP_EFF_VER}-fpm"
+      safe systemctl restart nginx
+      log "Timeout configurations applied and services restarted"
+    fi
     S_PHP="ok"
   else
     S_PHP="skipped"; mark_warn "Host PHP could not be installed (see /tmp/.php_install.log)"
@@ -359,8 +702,19 @@ if command -v "$wp_bin" >/dev/null 2>&1; then
   if [ "$S_DB" = "ok" ]; then
     DB_MODE="mysql"
     if [ ! -f "$WP_PATH/wp-config.php" ]; then
-      wp_run config create --dbname="$DB_NAME" --dbuser="$DB_USER" --dbpass="$DB_PASS" --dbhost="localhost" --skip-check \
-        >/tmp/.wp_config.log 2>&1 || mark_warn "wp-config create failed"
+      log "Creating wp-config.php..."
+      if wp_run config create --dbname="$DB_NAME" --dbuser="$DB_USER" --dbpass="$DB_PASS" --dbhost="localhost" --skip-check \
+        >/tmp/.wp_config.log 2>&1; then
+        log "wp-config.php created successfully"
+        # Set proper permissions immediately
+        safe chown www-data:www-data "$WP_PATH/wp-config.php"
+        safe chmod 644 "$WP_PATH/wp-config.php"
+      else
+        warn "wp-config create failed, check /tmp/.wp_config.log"
+        cat /tmp/.wp_config.log || true
+      fi
+    else
+      log "wp-config.php already exists"
     fi
   else
     INSTALL_WARN="Database not ready; WordPress install will be retried on next run."
@@ -368,18 +722,60 @@ if command -v "$wp_bin" >/dev/null 2>&1; then
 
   # (c) Headless install if PHP + DB OK and not installed yet
   if [ "$S_PHP" = "ok" ] && [ "$S_DB" = "ok" ]; then
+    # Ensure proper file ownership before installation
+    safe chown -R www-data:www-data "$WP_PATH"
+    safe chmod -R 755 "$WP_PATH"
+    
+    # Test database connection before proceeding
+    if ! wp_run db check >/dev/null 2>&1; then
+      warn "Database connection failed, attempting to recreate wp-config.php..."
+      rm -f "$WP_PATH/wp-config.php"
+      wp_run config create --dbname="$DB_NAME" --dbuser="$DB_USER" --dbpass="$DB_PASS" --dbhost="localhost" --skip-check \
+        >/tmp/.wp_config_retry.log 2>&1 || mark_warn "wp-config recreate failed"
+    fi
+    
     if ! wp_run core is-installed >/dev/null 2>&1; then
-      if ! wp_core_install_with_retries "$SITE_URL" "$SITE_TITLE" "$ADMIN_USER" "$ADMIN_PASS" "$ADMIN_EMAIL"; then
+      log "WordPress not installed, proceeding with installation..."
+      if ! wp_core_install_with_retries "$SITE_URL" "$SITE_TITLE" "$ADMIN_USER" "$ADMIN_PASS" "$ADMIN_EMAIL" "$LOCALE"; then
         INSTALL_WARN="WordPress core install step had issues after retries"
+        # Try manual verification
+        if wp_run core is-installed >/dev/null 2>&1; then
+          log "WordPress installation completed successfully on retry verification"
+        else
+          warn "WordPress installation failed - will redirect to install.php"
+        fi
+      else
+        log "WordPress installation completed successfully"
       fi
+    else
+      log "WordPress already installed, skipping installation step"
     fi
 
-    # Force English (skip language screen) + sane defaults
-    wp_run language core install "$LOCALE" >/dev/null 2>&1 || true
-    wp_run language core activate "$LOCALE" >/dev/null 2>&1 || true
-    wp_run option update blog_public 0 >/dev/null 2>&1 || true
-    wp_run rewrite structure "/%postname%/" >/dev/null 2>&1 || true
-    wp_run rewrite flush --hard >/dev/null 2>&1 || true
+    # Only proceed with post-install configuration if WordPress is actually installed
+    if wp_run core is-installed >/dev/null 2>&1; then
+      log "Configuring WordPress post-installation settings..."
+      
+      # Configure WordPress language (enhanced language setup)
+      configure_wp_language
+      
+      # Configure sane defaults
+      wp_run option update blog_public 0 >/dev/null 2>&1 || true
+      wp_run rewrite structure "/%postname%/" >/dev/null 2>&1 || true
+      wp_run rewrite flush --hard >/dev/null 2>&1 || true
+      
+      S_WP="ok"
+    else
+      warn "WordPress installation verification failed"
+      S_WP="failed"
+    fi
+
+    # Configure WordPress constants for plugin updates and performance
+    if configure_wp_config_constants; then
+      # Set proper ownership after modifying wp-config.php
+      safe chown www-data:www-data "${WP_PATH}/wp-config.php"
+      safe chmod 644 "${WP_PATH}/wp-config.php"
+      log "WordPress configuration constants and file permissions updated"
+    fi
 
     # --- Info page (idempotent) ---
     INFO_PAGE_TITLE="Info"
@@ -417,15 +813,59 @@ if command -v "$wp_bin" >/dev/null 2>&1; then
   fi
 
   # Version check + final status
+  # Final WordPress verification and status
   WP_EFF_VER="$(wp_run core version 2>/dev/null | tail -n1)"
-  if [ -n "$WP_EFF_VER" ] || wp_run core is-installed >/dev/null 2>&1; then
+  
+  log "=== WordPress Installation Verification ==="
+  
+  # Check if WordPress is installed
+  if wp_run core is-installed >/dev/null 2>&1; then
     S_WP="ok"; INSTALL_WARN=""
+    log "✓ WordPress is properly installed"
+    log "✓ WordPress version: ${WP_EFF_VER:-unknown}"
+    
+    # Check if we can access the database
+    if wp_run db check >/dev/null 2>&1; then
+      log "✓ Database connection working"
+    else
+      warn "✗ Database connection issues detected"
+    fi
+    
+    # Check if admin user exists
+    if wp_run user get "$ADMIN_USER" >/dev/null 2>&1; then
+      log "✓ Admin user '$ADMIN_USER' exists"
+    else
+      warn "✗ Admin user '$ADMIN_USER' not found"
+    fi
+    
+    # Check wp-config.php
+    if [[ -f "$WP_PATH/wp-config.php" ]]; then
+      log "✓ wp-config.php exists"
+    else
+      warn "✗ wp-config.php missing"
+    fi
+    
   else
-    [ -z "$INSTALL_WARN" ] && INSTALL_WARN="Prereqs for WordPress missing (php/db/wp-cli)"
-    S_WP="skipped"
+    warn "✗ WordPress installation verification failed"
+    warn "  This means the site will redirect to wp-admin/install.php"
+    
+    # Debug information
+    log "=== Debug Information ==="
+    log "WordPress path: $WP_PATH"
+    log "wp-config.php exists: $([[ -f "$WP_PATH/wp-config.php" ]] && echo "yes" || echo "no")"
+    log "Database status: $S_DB"
+    log "PHP status: $S_PHP"
+    
+    if [[ -f "/tmp/.wp_install_1.log" ]]; then
+      log "Last installation attempt log:"
+      tail -10 /tmp/.wp_install_1.log 2>/dev/null || true
+    fi
+    
+    S_WP="failed"
+    INSTALL_WARN="WordPress installation incomplete - will show install.php"
   fi
 
-  # Perms
+  # Set proper permissions
   safe chown -R www-data:www-data "$WP_PATH"
   safe find "$WP_PATH" -type d -exec chmod 755 {} \;
   safe find "$WP_PATH" -type f -exec chmod 644 {} \;
@@ -510,14 +950,13 @@ if [ -f "$WP_PATH/wp-config.php" ]; then
   fi
 fi
 
-# 4) Ensure required auth plugin present (idempotent) + preinstall big plugin to warm caches
+# 4) Ensure required auth plugin present (idempotent)
 if command -v "$wp_bin" >/dev/null 2>&1; then
   # JSON Basic Auth for REST
   wp_run plugin install json-basic-authentication --activate >/dev/null 2>&1 || true
 
-  # (Optional but helpful) make sure target plugin exists before REST updating
-  # This reduces time spent fetching during REST calls and avoids first-time unzip delays.
-  wp_run plugin install all-in-one-wp-migration --activate >/dev/null 2>&1 || true
+  # Install custom plugins
+  install_custom_plugins
 
   # Flush rewrite just in case REST routes changed
   wp_run rewrite flush --hard >/dev/null 2>&1 || true

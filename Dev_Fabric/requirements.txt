@@ -9,3 +9,5 @@ fabric
 invoke
 paramiko
 email-validator
+watchdog
+requests
