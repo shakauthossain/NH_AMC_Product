@@ -46,6 +46,7 @@ S_DB="pending"
 S_PHP="pending"
 S_WP="pending"
 S_SSL="skipped"
+APP_PASSWORD=""
 
 PHP_EFF_VER=""
 PHP_MODE="host-fpm-sock"
@@ -440,6 +441,163 @@ install_custom_plugins(){
   log "Custom plugin installation completed"
 }
 
+install_mu_safety_net(){
+  log "Installing NH Upgrader Safety Net MU plugin..."
+  
+  local MU_DIR="${WP_PATH}/wp-content/mu-plugins"
+  local MU_FILE="${MU_DIR}/nh-upgrader-safetynet.php"
+  
+  # Create mu-plugins directory if it doesn't exist
+  mkdir -p "$MU_DIR" 2>/dev/null || true
+  
+  # Skip if already installed
+  if [[ -f "$MU_FILE" ]]; then
+    log "NH Upgrader Safety Net already installed, skipping..."
+    return 0
+  fi
+  
+  cat > "$MU_FILE" << 'MUEOF'
+<?php
+/**
+ * Plugin Name: NH Upgrader Safety Net (MU)
+ * Description: Backup plugin folders before update; restore automatically if the update fails.
+ * Author: Notionhive
+ */
+
+if ( ! defined('ABSPATH') ) return;
+
+add_action('muplugins_loaded', function () {
+  if ( ! defined('WP_TEMP_DIR') ) define('WP_TEMP_DIR', WP_CONTENT_DIR . '/upgrade');
+  add_filter('unzip_file_use_ziparchive', '__return_true');
+  add_filter('http_request_timeout', fn($t)=>max((int)$t,300));
+
+  if ( ! defined('NH_PLUGIN_BACKUPS') )
+    define('NH_PLUGIN_BACKUPS', WP_CONTENT_DIR . '/upgrade/plugin-backups');
+
+  if ( ! is_dir(NH_PLUGIN_BACKUPS) ) @wp_mkdir_p(NH_PLUGIN_BACKUPS);
+
+  $plugin_dir = function ($plugin_file) {
+    $slug = dirname($plugin_file);
+    return ($slug === '.' ? '' : $slug);
+  };
+
+  // Before install: back up existing plugin folders
+  add_filter('upgrader_pre_install', function ($return, $hook_extra) use ($plugin_dir) {
+    if ( ! empty($hook_extra['type']) && $hook_extra['type']==='plugin' ) {
+      $targets = [];
+      if ( ! empty($hook_extra['plugin']) )  $targets[] = $hook_extra['plugin'];
+      if ( ! empty($hook_extra['plugins']) ) $targets = array_merge($targets, (array)$hook_extra['plugins']);
+      $targets = array_unique(array_filter($targets));
+
+      $map = [];
+      foreach ($targets as $base) {
+        $dir = $plugin_dir($base);
+        if ( ! $dir ) continue;
+        $abs = WP_PLUGIN_DIR . '/' . $dir;
+        if ( ! is_dir($abs) ) continue;
+        $backup = trailingslashit(NH_PLUGIN_BACKUPS) . $dir . '-' . time();
+        if ( @rename($abs, $backup) || ( @wp_mkdir_p($backup) && copy_dir($abs, $backup) && @rename($abs, $abs.'-old') ) ) {
+          $map[$abs] = $backup;
+          @wp_mkdir_p($abs);
+        }
+      }
+
+      if ( $map ) {
+        set_transient('nh_updater_backups', $map, 60 * 60);
+        @set_time_limit(600);
+        if ( function_exists('wp_raise_memory_limit') ) wp_raise_memory_limit('admin');
+      }
+    }
+    return $return;
+  }, 10, 2);
+
+  // After install: restore on failure, purge backups on success
+  add_filter('upgrader_install_package_result', function ($result, $hook_extra) {
+    if ( empty($hook_extra['type']) || $hook_extra['type']!=='plugin' ) return $result;
+
+    $map = get_transient('nh_updater_backups');
+    if ( ! is_array($map) || ! $map ) return $result;
+
+    $is_error = is_wp_error($result);
+    foreach ($map as $dest => $backup) {
+      if ( $is_error ) {
+        if ( is_dir($backup) ) {
+          if ( is_dir($dest) ) @rmdir($dest);
+          @rename($backup, $dest);
+          error_log('[NH SafetyNet] Restored plugin from backup: '.$dest);
+        }
+      } else {
+        if ( is_dir($backup) ) {
+          require_once ABSPATH . 'wp-admin/includes/file.php';
+          @WP_Filesystem();
+          global $wp_filesystem;
+          if ( $wp_filesystem ) { $wp_filesystem->rmdir($backup, true); }
+        }
+      }
+    }
+    delete_transient('nh_updater_backups');
+    return $result;
+  }, 10, 2);
+});
+MUEOF
+  
+  # Set proper ownership
+  chown www-data:www-data "$MU_FILE" 2>/dev/null || true
+  chmod 644 "$MU_FILE" 2>/dev/null || true
+  
+  # Verify PHP syntax
+  if php -l "$MU_FILE" >/dev/null 2>&1; then
+    log "NH Upgrader Safety Net MU plugin installed and validated"
+  else
+    warn "NH Upgrader Safety Net PHP syntax check failed, removing..."
+    rm -f "$MU_FILE" 2>/dev/null || true
+    return 1
+  fi
+  
+  return 0
+}
+
+create_app_password(){
+  log "Creating WordPress Application Password for REST API access..."
+  
+  # Check if WP-CLI is available and WordPress is installed
+  if ! command -v "$wp_bin" >/dev/null 2>&1; then
+    warn "WP-CLI not available, cannot create Application Password"
+    return 1
+  fi
+  
+  if ! wp_run core is-installed >/dev/null 2>&1; then
+    warn "WordPress not installed, cannot create Application Password"
+    return 1
+  fi
+  
+  # Check if an app password named "NH AMC" already exists
+  local EXISTING
+  EXISTING=$(wp_run user application-password list "$ADMIN_USER" --fields=name --format=csv 2>/dev/null | grep -c "NH AMC" || echo "0")
+  
+  if [[ "$EXISTING" -gt 0 ]]; then
+    log "Application Password 'NH AMC' already exists for user '$ADMIN_USER', skipping..."
+    APP_PASSWORD="already_exists"
+    return 0
+  fi
+  
+  # Create the application password
+  local RAW_OUTPUT
+  RAW_OUTPUT=$(wp_run user application-password create "$ADMIN_USER" "NH AMC" --porcelain 2>/dev/null)
+  
+  if [[ -n "$RAW_OUTPUT" ]]; then
+    # WP-CLI --porcelain outputs just the password string
+    APP_PASSWORD=$(echo "$RAW_OUTPUT" | tr -d '[:space:]')
+    log "Application Password created successfully for user '$ADMIN_USER'"
+    log "⚠️  IMPORTANT: Save this password — it will be shown in the provision report"
+    return 0
+  else
+    warn "Failed to create Application Password (WP-CLI command failed)"
+    APP_PASSWORD=""
+    return 1
+  fi
+}
+
 wp_core_install_with_retries(){
   local url="$1" title="$2" user="$3" pass="$4" email="$5" locale="$6"
   local tries=3 i=1
@@ -682,8 +840,42 @@ log "Provisioning WordPress…"
 if [ -n "$DOMAIN" ]; then
   SITE_URL="http://$DOMAIN"
 else
-  SITE_URL_IP="$(hostname -I 2>/dev/null | awk '{print $1}')"
+  # Detect public IP — avoid internal/Docker IPs (172.x, 10.x, 192.168.x)
+  SITE_URL_IP=""
+
+  # Method 1: Use external service to get the real public IP
+  for svc in "https://ifconfig.me" "https://icanhazip.com" "https://api.ipify.org"; do
+    SITE_URL_IP="$(curl -s --max-time 5 "$svc" 2>/dev/null | tr -d '[:space:]')"
+    # Validate it looks like an IP
+    if [[ "$SITE_URL_IP" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+      log "Detected public IP via $svc: $SITE_URL_IP"
+      break
+    fi
+    SITE_URL_IP=""
+  done
+
+  # Method 2: Filter hostname -I to skip private ranges
+  if [ -z "$SITE_URL_IP" ]; then
+    for ip in $(hostname -I 2>/dev/null); do
+      # Skip private/Docker ranges: 10.x, 172.16-31.x, 192.168.x, 169.254.x
+      if [[ "$ip" =~ ^10\. ]] || [[ "$ip" =~ ^172\.(1[6-9]|2[0-9]|3[01])\. ]] || \
+         [[ "$ip" =~ ^192\.168\. ]] || [[ "$ip" =~ ^169\.254\. ]]; then
+        continue
+      fi
+      SITE_URL_IP="$ip"
+      log "Detected public IP from hostname: $SITE_URL_IP"
+      break
+    done
+  fi
+
+  # Method 3: Last resort — use first hostname -I result
+  if [ -z "$SITE_URL_IP" ]; then
+    SITE_URL_IP="$(hostname -I 2>/dev/null | awk '{print $1}')"
+    warn "Could not detect public IP; using $SITE_URL_IP (may be internal)"
+  fi
+
   SITE_URL="http://${SITE_URL_IP:-127.0.0.1}"
+  log "WordPress site URL: $SITE_URL"
 fi
 
 INSTALL_WARN=""
@@ -958,6 +1150,12 @@ if command -v "$wp_bin" >/dev/null 2>&1; then
   # Install custom plugins
   install_custom_plugins
 
+  # Install NH Upgrader Safety Net as MU plugin
+  install_mu_safety_net
+
+  # Create Application Password for REST API access
+  create_app_password
+
   # Flush rewrite just in case REST routes changed
   wp_run rewrite flush --hard >/dev/null 2>&1 || true
 fi
@@ -991,6 +1189,8 @@ mkdir -p "$(dirname "$REPORT_PATH")" 2>/dev/null || true
   echo "  \"db_name\": \"${DB_NAME}\","
   echo "  \"db_user\": \"${DB_USER}\","
   echo "  \"admin_user\": \"${ADMIN_USER}\","
+  echo "  \"app_password\": \"${APP_PASSWORD}\","
+  echo "  \"mu_safety_net\": \"$([ -f "${WP_PATH}/wp-content/mu-plugins/nh-upgrader-safetynet.php" ] && echo 'installed' || echo 'missing')\","
   if [ "${#WARNINGS[@]}" -gt 0 ]; then
     printf '  "warnings": [%s]\n' "$(printf '"%s",' "${WARNINGS[@]}" | sed 's/,$//')"
   else
